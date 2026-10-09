@@ -1,4 +1,4 @@
-"""yt-dlp -> ffmpeg (pipe) -> catbox.moe. Detailed error logging version."""
+"""yt-dlp -> ffmpeg (pipe) -> catbox.moe. Nothing is written to disk except temp stream file."""
 import os
 import re
 import subprocess
@@ -28,6 +28,22 @@ if YT_COOKIES:
 app = FastAPI()
 JOBS: dict[str, dict] = {}
 SEM = threading.Semaphore(int(os.getenv("MAX_CONCURRENT", "1")))
+
+
+class ProgressFileReader:
+    """File wrapper that updates job bytes during HTTP post upload."""
+    def __init__(self, fp, job_ref):
+        self._fp = fp
+        self._job = job_ref
+
+    def read(self, size=-1):
+        chunk = self._fp.read(size)
+        if chunk:
+            self._job["bytes"] = self._fp.tell()
+        return chunk
+
+    def __getattr__(self, attr):
+        return getattr(self._fp, attr)
 
 
 def est_size(f, dur):
@@ -184,7 +200,7 @@ def run_job(jid, url):
 
             _, chosen, size = choice
             vf = chosen[0]
-            job.update(status="streaming",
+            job.update(status="downloading & processing",
                        quality=f"{vf.get('height') or 'unknown'}p ~{int(size / 1e6)} MB",
                        title=info.get("title"))
 
@@ -207,37 +223,35 @@ def run_job(jid, url):
 
                 if proc.wait() != 0:
                     err_msg = proc.stderr.read().decode()[-300:]
-                    raise RuntimeError(f"ffmpeg failed (exit code {proc.returncode}): {err_msg}")
+                    raise RuntimeError(f"ffmpeg failed (code {proc.returncode}): {err_msg}")
 
                 tmp.seek(0, os.SEEK_END)
                 actual_file_size = tmp.tell()
                 tmp.seek(0)
 
                 if actual_file_size == 0:
-                    raise RuntimeError("ffmpeg produced a 0-byte video file; upload cancelled.")
+                    raise RuntimeError("ffmpeg produced a 0-byte video file.")
 
-                job["status"] = "uploading"
+                job.update(status="uploading to catbox", total_size=actual_file_size)
 
                 data = {"reqtype": "fileupload"}
-                has_userhash = bool(USERHASH and re.match(r"^[a-f0-9]+$", USERHASH, re.IGNORECASE))
-                if has_userhash:
+                if USERHASH and re.match(r"^[a-f0-9]+$", USERHASH, re.IGNORECASE):
                     data["userhash"] = USERHASH
 
+                wrapped_file = ProgressFileReader(tmp, job)
                 files = {
-                    "fileToUpload": (f"{name}.mp4", tmp, "video/mp4")
+                    "fileToUpload": (f"{name}.mp4", wrapped_file, "video/mp4")
                 }
 
                 headers = {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
                 }
 
-                r = requests.post(CATBOX, data=data, files=files, headers=headers, timeout=900)
+                r = requests.post(CATBOX, data=data, files=files, headers=headers, timeout=(30, 600))
 
             out = r.text.strip()
             if not out.startswith("http"):
-                diag = (f"Catbox Error [HTTP {r.status_code}]: '{out[:200]}'\n"
-                        f"Debug: size={actual_file_size}B, userhash_sent={has_userhash}")
-                raise RuntimeError(diag)
+                raise RuntimeError(f"Catbox output error [HTTP {r.status_code}]: '{out[:200]}'")
 
             job.update(status="done", url=out)
 
@@ -290,7 +304,8 @@ body:JSON.stringify({url:u.value,token:t.value})});
 if(!r.ok){o.textContent='Error '+r.status;return}
 const {id}=await r.json();
 const i=setInterval(async()=>{const j=await (await fetch('/api/jobs/'+id)).json();
-o.textContent=j.status+(j.quality?'\\n'+j.quality:'')+(j.bytes?'\\n'+(j.bytes/1e6).toFixed(1)+' MB':'')
+const sizeStr = j.total_size ? ((j.bytes/1e6).toFixed(1) + '/' + (j.total_size/1e6).toFixed(1) + ' MB') : ((j.bytes/1e6).toFixed(1) + ' MB');
+o.textContent=j.status+(j.quality?'\\n'+j.quality:'')+'\\n'+sizeStr
 +(j.note?'\\n'+j.note:'')+(j.error?'\\n'+j.error:'')+(j.url?'\\n'+j.url:'');
 if(j.status=='done'||j.status=='error')clearInterval(i)},1500)}
 </script>"""
