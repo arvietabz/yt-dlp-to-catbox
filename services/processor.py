@@ -196,6 +196,7 @@ def process_job_sync(jid, source_url):
         _, chosen, size = choice
         vf = chosen[0]
         title_text = job.get("custom_title") or info.get("title") or "Unsupported Video Stream"
+        total_duration = info.get("duration") or 0
         
         job.update(
             status="downloading & processing",
@@ -205,22 +206,46 @@ def process_job_sync(jid, source_url):
         )
 
         cmd = build_ffmpeg_cmd(chosen, out_path, enc, extra_headers=custom_headers, proxy=job_proxy)
-        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, bufsize=1)
 
+        buffer = ""
         while proc.poll() is None:
-            time.sleep(0.5)
+            time.sleep(0.05)
             if job.get("cancelled"):
                 proc.kill()
                 raise RuntimeError("Job cancelled by user.")
+
+            # Read stderr character by character to catch real-time FFmpeg progress
+            char = proc.stderr.read(1) if proc.stderr else ""
+            if char:
+                if char in ("\r", "\n"):
+                    line = buffer.strip()
+                    buffer = ""
+                    match = re.search(r"time=(\d+):(\d+):(\d+\.\d+|\d+)", line)
+                    if match and total_duration > 0:
+                        h, m, s = float(match.group(1)), float(match.group(2)), float(match.group(3))
+                        curr_sec = h * 3600 + m * 60 + s
+                        pct = min(99.9, (curr_sec / total_duration) * 100)
+                        job["download_pct"] = round(pct, 1)
+                else:
+                    buffer += char
+
             if os.path.exists(out_path):
                 curr_size = os.path.getsize(out_path)
                 job["bytes"] = curr_size
+                
+                dl_pct = job.get("download_pct")
+                if dl_pct is not None:
+                    job["log"] = f"Processing video streams: {dl_pct:.1f}% ({curr_size / 1e6:.1f} MB)"
+                else:
+                    job["log"] = f"Processing video streams with ffmpeg ({curr_size / 1e6:.1f} MB)..."
+
                 if curr_size > HARD_BYTES:
                     proc.kill()
                     raise RuntimeError("File size exceeded 1 GB ceiling during processing; aborted.")
 
         if proc.returncode != 0:
-            err_msg = proc.stderr.read().decode("utf-8", errors="replace")[-400:]
+            err_msg = proc.stderr.read()[-400:] if proc.stderr else ""
             raise RuntimeError(f"FFmpeg failed (exit code {proc.returncode}): {err_msg}")
 
         if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
