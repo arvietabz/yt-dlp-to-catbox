@@ -5,6 +5,8 @@ File: app.py
 """
 import asyncio
 import base64
+import datetime
+import importlib
 import ipaddress
 import os
 import re
@@ -22,6 +24,9 @@ MAX_BYTES = int(float(os.getenv("MAX_MB", "1000")) * 1_000_000)  # 1 GB target l
 HARD_BYTES = 1_050_000_000                                        # 1.05 GB ceiling
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "").strip()
 LITTERBOX_URL = "https://litterbox.catbox.moe/resources/internals/api.php"
+
+# Dynamic tracking of current yt-dlp version
+CURRENT_YTDLP_VERSION = yt_dlp.version.__version__
 
 # Raw PROXY variable read from Render environment
 RAW_PROXY = os.getenv("PROXY", "").strip()
@@ -146,6 +151,73 @@ async def start_proxy_bridge():
     return None
 
 
+async def ytdlp_auto_updater_loop():
+    """Background task that runs pip install --upgrade yt-dlp every 12 midnight UTC."""
+    global CURRENT_YTDLP_VERSION, yt_dlp
+    while True:
+        now = datetime.datetime.utcnow()
+        next_midnight = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        seconds_until_midnight = (next_midnight - now).total_seconds()
+        
+        await asyncio.sleep(seconds_until_midnight)
+
+        try:
+            print("[Auto-Updater] Checking for yt-dlp updates at midnight UTC...")
+            proc = await asyncio.create_subprocess_exec(
+                "pip", "install", "--upgrade", "yt-dlp[default,curl-cffi]",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await proc.communicate()
+            importlib.reload(yt_dlp)
+            CURRENT_YTDLP_VERSION = yt_dlp.version.__version__
+            print(f"[Auto-Updater] yt-dlp updated/verified to version: v{CURRENT_YTDLP_VERSION}")
+        except Exception as e:
+            print(f"[Auto-Updater] Midnight update failed: {e}")
+
+
+@app.post("/api/update-ytdlp")
+async def trigger_ytdlp_update():
+    """Manual endpoint to force upgrade yt-dlp immediately."""
+    global CURRENT_YTDLP_VERSION, yt_dlp
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "pip", "install", "--upgrade", "yt-dlp[default,curl-cffi]",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+        importlib.reload(yt_dlp)
+        CURRENT_YTDLP_VERSION = yt_dlp.version.__version__
+        return {
+            "status": "success",
+            "version": CURRENT_YTDLP_VERSION,
+            "log": stdout.decode("utf-8", errors="replace")[-300:]
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Update failed: {str(e)}")
+
+
+@app.get("/api/version")
+def get_version():
+    """Checks PyPI to see if the installed version is up to date."""
+    latest_version = CURRENT_YTDLP_VERSION
+    is_latest = True
+    try:
+        r = requests.get("https://pypi.org/pypi/yt-dlp/json", timeout=3)
+        if r.status_code == 200:
+            latest_version = r.json().get("info", {}).get("version", CURRENT_YTDLP_VERSION)
+            is_latest = (CURRENT_YTDLP_VERSION == latest_version)
+    except Exception:
+        pass
+
+    return {
+        "current_version": CURRENT_YTDLP_VERSION,
+        "latest_version": latest_version,
+        "is_latest": is_latest
+    }
+
+
 @app.get("/api/test-proxy")
 def test_proxy():
     if not PROXY:
@@ -263,13 +335,10 @@ def pick(info):
         v = f.get("vcodec")
         a = f.get("acodec")
         
-        # Audio only stream
         if v == "none" and a not in (None, "none"):
             aud.append(f)
-        # Video only stream
         elif a == "none" and v not in (None, "none"):
             vid.append(f)
-        # Combined stream or streams with null codec metadata (e.g. PornHub MP4/HLS)
         elif v != "none" and a != "none":
             prog.append(f)
         elif (f.get("height") or 0) > 0 or f.get("ext") in ("mp4", "webm", "m3u8", "mov", "flv"):
@@ -281,7 +350,7 @@ def pick(info):
     for p in prog:
         s = est_size(p, dur)
         if 0 <= s <= MAX_BYTES:
-            effective_s = s if s > 0 else 50_000_000  # Default ~50MB estimate if unknown
+            effective_s = s if s > 0 else 50_000_000
             cands.append((p.get("height") or 0, p.get("tbr") or 0, [p], effective_s))
 
     for v in vid:
@@ -481,15 +550,14 @@ def process_job_sync(jid, source_url):
             raise RuntimeError("Job cancelled by user.")
 
         final_size = os.path.getsize(out_path)
-        job.update(status="uploading to litterbox (1h expiry)", total_size=final_size, bytes=final_size)
-        job["log"] = f"File processed ({final_size / 1e6:.1f} MB). Dispatching HTTP upload..."
+        job.update(status="uploading to litterbox (1h expiry)", total_size=final_size, bytes=0)
+        job["log"] = f"Uploading to Litterbox: 0.0% (0.0 / {final_size / 1e6:.1f} MB)"
 
         clean_title = re.sub(r"[^A-Za-z0-9_\- ]", "", title_text)[:60].strip() or "video"
         ua = job.get("user_agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-        # Native streaming cURL upload to prevent Python RAM buffering & OOM crashes on Render
         curl_cmd = [
-            "curl", "-s", "-S",
+            "curl", "-#", "-S",
             "-A", ua,
             "-F", "reqtype=fileupload",
             "-F", "time=1h",
@@ -497,15 +565,47 @@ def process_job_sync(jid, source_url):
             LITTERBOX_URL
         ]
 
-        upload_proc = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=1200)
+        upload_proc = subprocess.Popen(
+            curl_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1
+        )
 
-        if upload_proc.returncode != 0:
-            raise RuntimeError(f"cURL upload failed (exit {upload_proc.returncode}): {upload_proc.stderr}")
+        buffer = ""
+        while upload_proc.poll() is None:
+            if job.get("cancelled"):
+                upload_proc.kill()
+                raise RuntimeError("Job cancelled by user.")
+
+            char = upload_proc.stderr.read(1)
+            if not char:
+                time.sleep(0.05)
+                continue
+
+            if char in ("\r", "\n"):
+                line = buffer.strip()
+                if line:
+                    match = re.search(r"(\d+(?:\.\d+)?)%", line)
+                    if match:
+                        pct = float(match.group(1))
+                        uploaded_bytes = int((pct / 100.0) * final_size)
+                        job["bytes"] = uploaded_bytes
+                        job["log"] = f"Uploading to Litterbox: {pct:.1f}% ({uploaded_bytes / 1e6:.1f} / {final_size / 1e6:.1f} MB)"
+                buffer = ""
+            else:
+                buffer += char
 
         if job.get("cancelled"):
             raise RuntimeError("Job cancelled by user.")
 
-        out_url = upload_proc.stdout.strip()
+        stdout_data, stderr_data = upload_proc.communicate()
+
+        if upload_proc.returncode != 0:
+            raise RuntimeError(f"cURL upload failed (exit {upload_proc.returncode}): {stderr_data[:200]}")
+
+        out_url = stdout_data.strip()
         if not out_url.startswith("http"):
             raise RuntimeError(f"Litterbox response error: '{out_url[:200]}'")
 
@@ -563,6 +663,7 @@ async def startup_event():
         await start_proxy_bridge()
 
     asyncio.create_task(queue_worker())
+    asyncio.create_task(ytdlp_auto_updater_loop())
 
 
 class Req(BaseModel):
@@ -652,22 +753,22 @@ def get_job(jid: str):
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
+    return f"""<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>yt → litterbox</title>
 <style>
-  body{font:15px system-ui,-apple-system,sans-serif;max-width:540px;margin:1.5rem auto;padding:0 1rem;background:#f9f9f9;color:#222}
-  input,button{width:100%;padding:.75rem;margin:.3rem 0;font-size:1rem;box-sizing:border-box;border-radius:6px;border:1px solid #ccc}
-  button{background:#0066cc;color:#fff;font-weight:600;border:none;cursor:pointer}
-  button:hover{background:#0052a3}
+  body{{font:15px system-ui,-apple-system,sans-serif;max-width:540px;margin:1.5rem auto;padding:0 1rem;background:#f9f9f9;color:#222}}
+  input,button{{width:100%;padding:.75rem;margin:.3rem 0;font-size:1rem;box-sizing:border-box;border-radius:6px;border:1px solid #ccc}}
+  button{{background:#0066cc;color:#fff;font-weight:600;border:none;cursor:pointer}}
+  button:hover{{background:#0052a3}}
   
-  .input-wrapper {
+  .input-wrapper {{
     position: relative;
     width: 100%;
-  }
-  .input-wrapper input {
+  }}
+  .input-wrapper input {{
     padding-right: 42px !important;
-  }
-  .input-action-btn {
+  }}
+  .input-action-btn {{
     position: absolute;
     right: 8px;
     top: 50%;
@@ -683,32 +784,32 @@ def home():
     align-items: center;
     justify-content: center;
     border-radius: 4px;
-  }
-  .input-action-btn:hover {
+  }}
+  .input-action-btn:hover {{
     color: #222;
-  }
+  }}
 
-  details {
+  details {{
     margin: .6rem 0;
     border: 1px dashed #bbb;
     border-radius: 6px;
     padding: .5rem .8rem;
     background: #fafafa;
-  }
-  summary {
+  }}
+  summary {{
     font-weight: 600;
     font-size: .85rem;
     color: #444;
     cursor: pointer;
-  }
-  .adv-option {
+  }}
+  .adv-option {{
     margin-top: .4rem;
-  }
-  .adv-option input {
+  }}
+  .adv-option input {{
     padding: .5rem;
     font-size: .85rem;
-  }
-  .checkbox-label {
+  }}
+  .checkbox-label {{
     display: flex;
     align-items: center;
     gap: 8px;
@@ -716,19 +817,19 @@ def home():
     color: #333;
     margin: .4rem 0;
     cursor: pointer;
-  }
-  .checkbox-label input {
+  }}
+  .checkbox-label input {{
     width: auto !important;
     margin: 0 !important;
-  }
+  }}
 
-  .swipe-container {
+  .swipe-container {{
     position: relative;
     overflow: hidden;
     margin: .8rem 0;
     border-radius: 8px;
-  }
-  .swipe-action-bg {
+  }}
+  .swipe-action-bg {{
     position: absolute;
     top: 0; right: 0; bottom: 0; left: 0;
     background: #d9534f;
@@ -738,8 +839,8 @@ def home():
     padding-right: 20px;
     border-radius: 8px;
     z-index: 1;
-  }
-  .swipe-action-btn {
+  }}
+  .swipe-action-btn {{
     background: transparent !important;
     border: none !important;
     color: white !important;
@@ -749,9 +850,9 @@ def home():
     cursor: pointer;
     display: flex;
     align-items: center;
-  }
+  }}
 
-  .card{
+  .card{{
     position: relative;
     z-index: 2;
     background:#fff;
@@ -760,29 +861,29 @@ def home():
     padding:.8rem 1rem;
     box-shadow:0 1px 3px rgba(0,0,0,0.05);
     transition: transform 0.15s ease-out;
-  }
-  .card.active{border-left:5px solid #0066cc}
-  .card.queued{border-left:5px solid #f0ad4e}
-  .card.done{border-left:5px solid #5cb85c}
-  .card.error,.card.cancelled{border-left:5px solid #d9534f}
+  }}
+  .card.active{{border-left:5px solid #0066cc}}
+  .card.queued{{border-left:5px solid #f0ad4e}}
+  .card.done{{border-left:5px solid #5cb85c}}
+  .card.error,.card.cancelled{{border-left:5px solid #d9534f}}
   
-  .badge{display:inline-block;padding:.2rem .5rem;font-size:.75rem;font-weight:bold;border-radius:4px;text-transform:uppercase}
-  .badge-active{background:#e6f2ff;color:#0066cc}
-  .badge-queued{background:#fef5e7;color:#f0ad4e}
-  .badge-done{background:#eafaf1;color:#27ae60}
-  .badge-error{background:#fadbd8;color:#c0392b}
+  .badge{{display:inline-block;padding:.2rem .5rem;font-size:.75rem;font-weight:bold;border-radius:4px;text-transform:uppercase}}
+  .badge-active{{background:#e6f2ff;color:#0066cc}}
+  .badge-queued{{background:#fef5e7;color:#f0ad4e}}
+  .badge-done{{background:#eafaf1;color:#27ae60}}
+  .badge-error{{background:#fadbd8;color:#c0392b}}
   
-  .section-header {
+  .section-header {{
     display: flex;
     align-items: center;
     justify-content: space-between;
     margin: 1.2rem 0 .4rem 0;
     border-bottom: 1px solid #ddd;
     padding-bottom: .3rem;
-  }
-  .section-title{font-size:1.1rem;font-weight:bold;color:#444}
+  }}
+  .section-title{{font-size:1.1rem;font-weight:bold;color:#444}}
   
-  .clear-btn {
+  .clear-btn {{
     width: auto !important;
     padding: .25rem .6rem !important;
     font-size: .8rem !important;
@@ -791,24 +892,24 @@ def home():
     border: 1px solid #ccc !important;
     border-radius: 4px !important;
     margin: 0 !important;
-  }
-  .clear-btn:hover {
+  }}
+  .clear-btn:hover {{
     background: #fee !important;
     color: #c0392b !important;
     border-color: #f5c6cb !important;
-  }
+  }}
 
-  button.cancel{background:#d9534f;color:#fff;padding:.4rem .8rem;font-size:.85rem;width:auto;margin-top:.4rem}
-  button.cancel:hover{background:#c9302c}
+  button.cancel{{background:#d9534f;color:#fff;padding:.4rem .8rem;font-size:.85rem;width:auto;margin-top:.4rem}}
+  button.cancel:hover{{background:#c9302c}}
 
-  .url-row {
+  .url-row {{
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 8px;
     margin-top: .4rem;
-  }
-  .copy-btn {
+  }}
+  .copy-btn {{
     width: auto !important;
     padding: 4px 8px !important;
     margin: 0 !important;
@@ -819,13 +920,21 @@ def home():
     display: flex;
     align-items: center;
     justify-content: center;
-  }
-  .copy-btn:hover {
+  }}
+  .copy-btn:hover {{
     background: #e0e0e0 !important;
-  }
+  }}
+
+  .ytdlp-tag {{
+    text-align: center;
+    font-size: 0.78rem;
+    color: #888;
+    margin: 1rem 0 0.2rem 0;
+    user-select: none;
+  }}
   
-  a{color:#0066cc;text-decoration:none;word-break:break-all}
-  a:hover{text-decoration:underline}
+  a{{color:#0066cc;text-decoration:none;word-break:break-all}}
+  a:hover{{text-decoration:underline}}
 </style>
 
 <h2>Video → Litterbox (1h Expiry / 1 GB Limit)</h2>
@@ -865,69 +974,92 @@ def home():
 
 <div id="queueContainer"></div>
 
+<div class="ytdlp-tag" id="ytdlpTag">yt-dlp v{CURRENT_YTDLP_VERSION}</div>
+
+<div id="activityContainer"></div>
+
 <script>
-function escapeHtml(str) {
+function escapeHtml(str) {{
   return (str || '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
+}}
 
 const openCards = new Set();
-let touchState = {};
+let touchState = {{}};
 
 const pasteIcon = `<svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 012 2v14a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect></svg>`;
 const clearIcon = `<svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"></path></svg>`;
 
-function updateInputActionIcon() {
+function updateInputActionIcon() {{
   const u = document.getElementById('u');
   const btn = document.getElementById('inputActionBtn');
   if (!u || !btn) return;
-  if (u.value.trim() !== '') {
+  if (u.value.trim() !== '') {{
     btn.innerHTML = clearIcon;
     btn.title = 'Clear URL';
-  } else {
+  }} else {{
     btn.innerHTML = pasteIcon;
     btn.title = 'Paste from Clipboard';
-  }
-}
+  }}
+}}
 
-async function handleInputAction() {
+async function fetchVersion() {{
+  try {{
+    const res = await fetch('/api/version');
+    if(res.ok) {{
+      const data = await res.json();
+      const el = document.getElementById('ytdlpTag');
+      if(el && data.current_version) {{
+        if(data.is_latest) {{
+          el.innerHTML = 'yt-dlp v' + escapeHtml(data.current_version) + ' <span style="color:#27ae60;font-weight:600">(Up to date)</span>';
+        }} else {{
+          el.innerHTML = 'yt-dlp v' + escapeHtml(data.current_version) + ' <span style="color:#e67e22;font-weight:600">(Update available: v' + escapeHtml(data.latest_version) + ')</span>';
+        }}
+      }}
+    }}
+  }} catch(e) {{}}
+}}
+
+async function handleInputAction() {{
   const u = document.getElementById('u');
   if (!u) return;
-  if (u.value.trim() !== '') {
+  if (u.value.trim() !== '') {{
     u.value = '';
     u.focus();
     updateInputActionIcon();
-  } else {
-    try {
+  }} else {{
+    try {{
       const text = await navigator.clipboard.readText();
-      if (text) {
+      if (text) {{
         u.value = text.trim();
         updateInputActionIcon();
-      }
-    } catch (err) {
+      }}
+    }} catch (err) {{
       alert('Unable to read clipboard. Please grant clipboard permission.');
-    }
-  }
-}
+    }}
+  }}
+}}
 
-window.addEventListener('DOMContentLoaded', () => {
+window.addEventListener('DOMContentLoaded', () => {{
   const urlInput = document.getElementById('u');
   const tokenInput = document.getElementById('t');
   
   const savedToken = localStorage.getItem('access_token');
   if(savedToken) tokenInput.value = savedToken;
   
-  tokenInput.addEventListener('input', () => {
+  tokenInput.addEventListener('input', () => {{
     localStorage.setItem('access_token', tokenInput.value.trim());
-  });
+  }});
 
   urlInput.addEventListener('input', updateInputActionIcon);
   updateInputActionIcon();
 
   fetchQueue();
+  fetchVersion();
   setInterval(fetchQueue, 1500);
-});
+  setInterval(fetchVersion, 60000);
+}});
 
-async function submitJob() {
+async function submitJob() {{
   const u = document.getElementById('u');
   const t = document.getElementById('t');
   const ref = document.getElementById('ref');
@@ -939,11 +1071,11 @@ async function submitJob() {
 
   if(!u.value.trim()) return;
   
-  if(t.value.trim()) {
+  if(t.value.trim()) {{
     localStorage.setItem('access_token', t.value.trim());
-  }
+  }}
 
-  const payload = {
+  const payload = {{
     url: u.value.trim(),
     token: t.value.trim(),
     referer: ref.value.trim(),
@@ -952,15 +1084,15 @@ async function submitJob() {
     direct_mode: directMode.checked,
     force_generic: forceGeneric.checked,
     use_proxy: useProxy.checked
-  };
+  }};
 
-  const r = await fetch('/api/jobs', {
+  const r = await fetch('/api/jobs', {{
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
+    headers: {{'Content-Type': 'application/json'}},
     body: JSON.stringify(payload)
-  });
+  }});
   
-  if(r.ok) {
+  if(r.ok) {{
     u.value = '';
     ref.value = '';
     ua.value = '';
@@ -970,47 +1102,47 @@ async function submitJob() {
     useProxy.checked = false;
     updateInputActionIcon();
     fetchQueue();
-  } else {
+  }} else {{
     alert('Failed to submit job: HTTP ' + r.status);
-  }
-}
+  }}
+}}
 
-async function cancelJob(jid) {
-  await fetch('/api/jobs/' + jid + '/cancel', {method: 'POST'});
+async function cancelJob(jid) {{
+  await fetch('/api/jobs/' + jid + '/cancel', {{method: 'POST'}});
   openCards.delete(jid);
   fetchQueue();
-}
+}}
 
-async function deleteCard(jid) {
+async function deleteCard(jid) {{
   openCards.delete(jid);
-  await fetch('/api/jobs/' + jid, {method: 'DELETE'});
+  await fetch('/api/jobs/' + jid, {{method: 'DELETE'}});
   fetchQueue();
-}
+}}
 
-async function clearAllHistory() {
-  await fetch('/api/jobs/clear-history', {method: 'POST'});
+async function clearAllHistory() {{
+  await fetch('/api/jobs/clear-history', {{method: 'POST'}});
   openCards.clear();
   fetchQueue();
-}
+}}
 
-function copyToClipboard(text, btn) {
-  navigator.clipboard.writeText(text).then(() => {
+function copyToClipboard(text, btn) {{
+  navigator.clipboard.writeText(text).then(() => {{
     const origHTML = btn.innerHTML;
     btn.innerHTML = '<span style="font-size:11px;color:#27ae60">✓ Copied</span>';
     setTimeout(() => btn.innerHTML = origHTML, 1500);
-  });
-}
+  }});
+}}
 
-function handleTouchStart(e, jid) {
+function handleTouchStart(e, jid) {{
   const isAlreadyOpen = openCards.has(jid);
-  touchState[jid] = { 
+  touchState[jid] = {{ 
     startX: e.touches[0].clientX, 
     currentX: isAlreadyOpen ? -70 : 0,
     isAlreadyOpen 
-  };
-}
+  }};
+}}
 
-function handleTouchMove(e, jid) {
+function handleTouchMove(e, jid) {{
   if (!touchState[jid]) return;
   const deltaX = e.touches[0].clientX - touchState[jid].startX;
   let newX = (touchState[jid].isAlreadyOpen ? -70 : 0) + deltaX;
@@ -1019,28 +1151,28 @@ function handleTouchMove(e, jid) {
   
   touchState[jid].currentX = newX;
   const cardEl = document.getElementById('card-el-' + jid);
-  if (cardEl) cardEl.style.transform = `translateX(${newX}px)`;
-}
+  if (cardEl) cardEl.style.transform = `translateX(${{newX}}px)`;
+}}
 
-function handleTouchEnd(e, jid) {
+function handleTouchEnd(e, jid) {{
   if (!touchState[jid]) return;
   const finalX = touchState[jid].currentX;
   const cardEl = document.getElementById('card-el-' + jid);
   
-  if (cardEl) {
-    if (finalX < -35) {
+  if (cardEl) {{
+    if (finalX < -35) {{
       cardEl.style.transform = 'translateX(-70px)';
       openCards.add(jid);
-    } else {
+    }} else {{
       cardEl.style.transform = 'translateX(0px)';
       openCards.delete(jid);
-    }
-  }
+    }}
+  }}
   delete touchState[jid];
-}
+}}
 
-async function fetchQueue() {
-  try {
+async function fetchQueue() {{
+  try {{
     const res = await fetch('/api/jobs');
     if(!res.ok) return;
     const jobs = await res.json();
@@ -1049,97 +1181,99 @@ async function fetchQueue() {
     const queued = jobs.filter(j => j.status === 'queued');
     const finished = jobs.filter(j => ['done', 'error', 'cancelled'].includes(j.status));
     
-    let html = '';
+    let queueHtml = '';
+    let activityHtml = '';
     
-    if(active.length > 0) {
-      html += '<div class="section-header"><div class="section-title">Currently Processing</div></div>';
-      active.forEach(j => {
+    if(active.length > 0) {{
+      queueHtml += '<div class="section-header"><div class="section-title">Currently Processing</div></div>';
+      active.forEach(j => {{
         const isOpen = openCards.has(j.id);
         const transformStyle = isOpen ? 'transform: translateX(-70px);' : '';
         const sizeStr = j.total_size ? ((j.bytes/1e6).toFixed(1) + '/' + (j.total_size/1e6).toFixed(1) + ' MB') : ((j.bytes/1e6).toFixed(1) + ' MB');
         
-        html += `<div class="swipe-container">
+        queueHtml += `<div class="swipe-container">
           <div class="swipe-action-bg">
-            <button class="swipe-action-btn" onclick="deleteCard('${j.id}')">
+            <button class="swipe-action-btn" onclick="deleteCard('${{j.id}}')">
               <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6"/></svg>
             </button>
           </div>
-          <div class="card active" id="card-el-${j.id}" style="${transformStyle}" ontouchstart="handleTouchStart(event, '${j.id}')" ontouchmove="handleTouchMove(event, '${j.id}')" ontouchend="handleTouchEnd(event, '${j.id}')">
+          <div class="card active" id="card-el-${{j.id}}" style="${{transformStyle}}" ontouchstart="handleTouchStart(event, '${{j.id}}')" ontouchmove="handleTouchMove(event, '${{j.id}}')" ontouchend="handleTouchEnd(event, '${{j.id}}')">
             <div>
-              <span class="badge badge-active">${escapeHtml(j.status)}</span>
-              ${j.use_proxy ? '<span class="badge badge-queued" style="margin-left:4px">PROXY ON</span>' : ''}
+              <span class="badge badge-active">${{escapeHtml(j.status)}}</span>
+              ${{j.use_proxy ? '<span class="badge badge-queued" style="margin-left:4px">PROXY ON</span>' : ''}}
             </div>
-            <div style="margin-top:.4rem"><b>${escapeHtml(j.title || j.source_url)}</b></div>
-            ${j.quality ? '<div>Quality: ' + escapeHtml(j.quality) + '</div>' : ''}
-            <div>Size: ${sizeStr}</div>
-            ${j.log ? '<div style="color:#666;font-size:.85rem;margin-top:.3rem">' + escapeHtml(j.log) + '</div>' : ''}
-            <button class="cancel" onclick="cancelJob('${j.id}')">Cancel Job</button>
+            <div style="margin-top:.4rem"><b>${{escapeHtml(j.title || j.source_url)}}</b></div>
+            ${{j.quality ? '<div>Quality: ' + escapeHtml(j.quality) + '</div>' : ''}}
+            <div>Size: ${{sizeStr}}</div>
+            ${{j.log ? '<div style="color:#666;font-size:.85rem;margin-top:.3rem">' + escapeHtml(j.log) + '</div>' : ''}}
+            <button class="cancel" onclick="cancelJob('${{j.id}}')">Cancel Job</button>
           </div>
         </div>`;
-      });
-    }
+      }});
+    }}
     
-    if(queued.length > 0) {
-      html += '<div class="section-header"><div class="section-title">Pending Queue (' + queued.length + ')</div></div>';
-      queued.forEach((j, idx) => {
+    if(queued.length > 0) {{
+      queueHtml += '<div class="section-header"><div class="section-title">Pending Queue (' + queued.length + ')</div></div>';
+      queued.forEach((j, idx) => {{
         const isOpen = openCards.has(j.id);
         const transformStyle = isOpen ? 'transform: translateX(-70px);' : '';
         
-        html += `<div class="swipe-container">
+        queueHtml += `<div class="swipe-container">
           <div class="swipe-action-bg">
-            <button class="swipe-action-btn" onclick="deleteCard('${j.id}')">
+            <button class="swipe-action-btn" onclick="deleteCard('${{j.id}}')">
               <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6"/></svg>
             </button>
           </div>
-          <div class="card queued" id="card-el-${j.id}" style="${transformStyle}" ontouchstart="handleTouchStart(event, '${j.id}')" ontouchmove="handleTouchMove(event, '${j.id}')" ontouchend="handleTouchEnd(event, '${j.id}')">
+          <div class="card queued" id="card-el-${{j.id}}" style="${{transformStyle}}" ontouchstart="handleTouchStart(event, '${{j.id}}')" ontouchmove="handleTouchMove(event, '${{j.id}}')" ontouchend="handleTouchEnd(event, '${{j.id}}')">
             <div>
-              <span class="badge badge-queued">Queue Position #${idx + 1}</span>
-              ${j.use_proxy ? '<span class="badge badge-queued" style="margin-left:4px">PROXY ON</span>' : ''}
+              <span class="badge badge-queued">Queue Position #${{idx + 1}}</span>
+              ${{j.use_proxy ? '<span class="badge badge-queued" style="margin-left:4px">PROXY ON</span>' : ''}}
             </div>
-            <div style="margin-top:.4rem;word-break:break-all"><b>${escapeHtml(j.source_url)}</b></div>
-            <button class="cancel" onclick="cancelJob('${j.id}')">Remove from Queue</button>
+            <div style="margin-top:.4rem;word-break:break-all"><b>${{escapeHtml(j.source_url)}}</b></div>
+            <button class="cancel" onclick="cancelJob('${{j.id}}')">Remove from Queue</button>
           </div>
         </div>`;
-      });
-    }
+      }});
+    }}
     
-    if(finished.length > 0) {
-      html += `<div class="section-header">
+    if(finished.length > 0) {{
+      activityHtml += `<div class="section-header">
         <div class="section-title">Recent Activity</div>
         <button class="clear-btn" onclick="clearAllHistory()">Clear All</button>
       </div>`;
-      finished.slice(0, 10).forEach(j => {
+      finished.slice(0, 10).forEach(j => {{
         const isOpen = openCards.has(j.id);
         const transformStyle = isOpen ? 'transform: translateX(-70px);' : '';
         const bClass = j.status === 'done' ? 'badge-done' : 'badge-error';
-        const copyBtn = j.result_url ? `<button class="copy-btn" onclick="copyToClipboard('${escapeHtml(j.result_url)}', this)" title="Copy Link">
+        const copyBtn = j.result_url ? `<button class="copy-btn" onclick="copyToClipboard('${{escapeHtml(j.result_url)}}', this)" title="Copy Link">
           <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
         </button>` : '';
 
-        html += `<div class="swipe-container">
+        activityHtml += `<div class="swipe-container">
           <div class="swipe-action-bg">
-            <button class="swipe-action-btn" onclick="deleteCard('${j.id}')">
+            <button class="swipe-action-btn" onclick="deleteCard('${{j.id}}')">
               <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6"/></svg>
             </button>
           </div>
-          <div class="card ${j.status}" id="card-el-${j.id}" style="${transformStyle}" ontouchstart="handleTouchStart(event, '${j.id}')" ontouchmove="handleTouchMove(event, '${j.id}')" ontouchend="handleTouchEnd(event, '${j.id}')">
+          <div class="card ${{j.status}}" id="card-el-${{j.id}}" style="${{transformStyle}}" ontouchstart="handleTouchStart(event, '${{j.id}}')" ontouchmove="handleTouchMove(event, '${{j.id}}')" ontouchend="handleTouchEnd(event, '${{j.id}}')">
             <div>
-              <span class="badge ${bClass}">${escapeHtml(j.status)}</span>
-              ${j.use_proxy ? '<span class="badge badge-queued" style="margin-left:4px">PROXY ON</span>' : ''}
+              <span class="badge ${{bClass}}">${{escapeHtml(j.status)}}</span>
+              ${{j.use_proxy ? '<span class="badge badge-queued" style="margin-left:4px">PROXY ON</span>' : ''}}
             </div>
-            <div style="margin-top:.3rem"><b>${escapeHtml(j.title || j.source_url)}</b></div>
-            ${j.result_url ? '<div class="url-row"><a href="' + escapeHtml(j.result_url) + '" target="_blank">' + escapeHtml(j.result_url) + '</a>' + copyBtn + '</div>' : ''}
-            ${j.error ? '<div style="color:#c0392b;font-size:.85rem;margin-top:.3rem">' + escapeHtml(j.error) + '</div>' : ''}
+            <div style="margin-top:.3rem"><b>${{escapeHtml(j.title || j.source_url)}}</b></div>
+            ${{j.result_url ? '<div class="url-row"><a href="' + escapeHtml(j.result_url) + '" target="_blank">' + escapeHtml(j.result_url) + '</a>' + copyBtn + '</div>' : ''}}
+            ${{j.error ? '<div style="color:#c0392b;font-size:.85rem;margin-top:.3rem">' + escapeHtml(j.error) + '</div>' : ''}}
           </div>
         </div>`;
-      });
-    }
+      }});
+    }}
     
-    if(jobs.length === 0) {
-      html = '<div style="text-align:center;color:#888;margin:2rem 0">No active or queued jobs.</div>';
-    }
+    if(jobs.length === 0) {{
+      activityHtml = '<div style="text-align:center;color:#888;margin:2rem 0">No active or queued jobs.</div>';
+    }}
     
-    document.getElementById('queueContainer').innerHTML = html;
-  } catch(e) {}
-}
+    document.getElementById('queueContainer').innerHTML = queueHtml;
+    document.getElementById('activityContainer').innerHTML = activityHtml;
+  }} catch(e) {{}}
+}}
 </script>"""
