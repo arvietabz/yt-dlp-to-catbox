@@ -53,6 +53,24 @@ def process_job_sync(jid, source_url):
                     }
                 }
 
+            # Parse custom extractor args (e.g. generic:impersonate)
+            if job.get("custom_args"):
+                try:
+                    from yt_dlp.utils import parse_map_param
+                    raw_args = [a for a in re.split(r'[\s;]+', job["custom_args"]) if a]
+                    parsed_args = parse_map_param(raw_args)
+                    
+                    if "extractor_args" not in opts:
+                        opts["extractor_args"] = {}
+
+                    for ext_key, ext_val in parsed_args.items():
+                        if ext_key in opts["extractor_args"]:
+                            opts["extractor_args"][ext_key].update(ext_val)
+                        else:
+                            opts["extractor_args"][ext_key] = ext_val
+                except Exception as e:
+                    job["log"] = f"Warning: Failed to parse custom_args ({e})"
+
             if custom_headers:
                 opts["http_headers"] = custom_headers
             if job_proxy:
