@@ -18,7 +18,6 @@ class Req(BaseModel):
     force_generic: bool = False
     use_proxy: bool = False
     cookies: str = ""
-    custom_args: str = ""
 
 @router.get("")
 def list_all_jobs():
@@ -50,8 +49,7 @@ async def create(req: Req):
         "direct_mode": req.direct_mode,
         "force_generic": req.force_generic,
         "use_proxy": req.use_proxy,
-        "cookies": req.cookies.strip(),
-        "custom_args": req.custom_args.strip()
+        "cookies": req.cookies.strip()
     }
     await state.JOB_QUEUE.put(jid)
     return {"id": jid}

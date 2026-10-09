@@ -38,15 +38,6 @@ def get_dashboard_html() -> str:
         Force Generic Extractor (--force-generic-extractor)
       </label>
 
-      <!-- Custom Extractor Args Controls -->
-      <label class="checkbox-label">
-        <input type="checkbox" id="useCustomArgs" onchange="handleCustomArgsCheckboxChange()">
-        ⚙️ Enable Custom Extractor Args
-      </label>
-      <div id="customArgsWrapper" style="display:none;margin:.4rem 0 .4rem 24px;">
-        <input id="customArgsInput" placeholder="e.g. generic:impersonate" oninput="handleCustomArgsInput(event)" style="font-size:.85rem;padding:.4rem;">
-      </div>
-
       <!-- Custom Cookies Controls -->
       <label class="checkbox-label">
         <input type="checkbox" id="useCookies" onchange="handleCookiesCheckboxChange()">
