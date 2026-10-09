@@ -28,14 +28,14 @@ def est_size(f, dur):
     if s:
         return s
     br = f.get("tbr") or ((f.get("vbr") or 0) + (f.get("abr") or 0)) or None
-    if br and dur:
+    if br and dur and dur > 0:
         return br * 1000 / 8 * dur
     return None
 
 
 def pick(info):
     """Best (video+audio) or progressive combo whose total size fits MAX_BYTES."""
-    dur = info.get("duration")
+    dur = info.get("duration") or 0
     fmts = [f for f in info.get("formats", []) if f.get("url") and f.get("protocol") not in ("mhtml",)]
     vid = [f for f in fmts if f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")]
     aud = [f for f in fmts if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
@@ -56,17 +56,19 @@ def pick(info):
             if as_ and vs + as_ <= MAX_BYTES:
                 cands.append(((v.get("height") or 0, v.get("tbr") or 0), [v, a], vs + as_))
                 break
+
     if not cands:
-        # sizes unknown for everything: gamble on a modest quality, hard cap aborts if too big
-        unk = [p for p in prog if not est_size(p, dur) and (p.get("height") or 0) <= 720]
+        # Fallback for unknown sizes or missing/0 duration: pick moderate format and rely on HARD_BYTES
+        unk = [p for p in prog if (p.get("height") or 0) <= 720]
         if unk:
             unk.sort(key=lambda f: f.get("height") or 0, reverse=True)
             return ((0, 0), [unk[0]], MAX_BYTES)
-        unk_v = [v for v in vid if not est_size(v, dur) and (v.get("height") or 0) <= 720]
+        unk_v = [v for v in vid if (v.get("height") or 0) <= 720]
         if unk_v and aud:
             unk_v.sort(key=lambda f: f.get("height") or 0, reverse=True)
             return ((0, 0), [unk_v[0], aud[-1]], MAX_BYTES)
         return None
+
     cands.sort(key=lambda c: c[0], reverse=True)
     return cands[0]
 
@@ -74,8 +76,10 @@ def pick(info):
 def plan_transcode(info):
     """Pick a source + bitrate so the re-encoded output lands under MAX_BYTES."""
     dur = info.get("duration")
-    if not dur:
-        return None
+    # If duration is missing/invalid, assume 3 minutes (180s) to calculate conservative bitrates
+    if not dur or dur <= 0:
+        dur = 180
+
     abr = 96
     total_kbps = MAX_BYTES * 0.92 * 8 / dur / 1000      # 8% safety margin
     vbr = int(total_kbps - abr)
@@ -85,9 +89,13 @@ def plan_transcode(info):
             target_h = h
             break
     else:
-        return None  # too long even for 240p
+        target_h = 240
+        vbr = 150
+
     fmts = [f for f in info.get("formats", []) if f.get("url") and f.get("protocol") != "mhtml"]
     vid = [f for f in fmts if f.get("vcodec") not in (None, "none")]
+    if not vid:
+        return None
     ok = [f for f in vid if (f.get("height") or 0) <= target_h] or vid
     ok.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
     src = ok[0]
