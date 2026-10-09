@@ -1,6 +1,6 @@
 """
 yt-dlp -> ffmpeg -> native Python HTTP upload (Litterbox 1GB / 1h expiry).
-FastAPI Server with Async Queue, Advanced Extraction Options, & Mobile UI Dashboard.
+FastAPI Server with Async Queue, Interactive Proxy Control, & Mobile UI Dashboard.
 File: app.py
 """
 import asyncio
@@ -128,13 +128,13 @@ def plan_transcode(info):
     return chosen, {"vbr": vbr, "abr": abr, "scale": scale}, MAX_BYTES, target_h
 
 
-def build_ffmpeg_cmd(chosen, out_path, enc=None, extra_headers=None):
+def build_ffmpeg_cmd(chosen, out_path, enc=None, extra_headers=None, proxy=None):
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-nostdin"]
     for f in chosen:
         merged_headers = {**(f.get("http_headers") or {}), **(extra_headers or {})}
         hdr = "".join(f"{k}: {v}\r\n" for k, v in merged_headers.items())
-        if PROXY:
-            cmd += ["-http_proxy", PROXY]
+        if proxy:
+            cmd += ["-http_proxy", proxy]
         cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
         if hdr:
             cmd += ["-headers", hdr]
@@ -166,6 +166,8 @@ def process_job_sync(jid, source_url):
         if job.get("cancelled"):
             raise RuntimeError("Job cancelled by user.")
 
+        job_proxy = PROXY if job.get("use_proxy") else ""
+
         custom_headers = {}
         if job.get("referer"):
             custom_headers["Referer"] = job["referer"]
@@ -191,7 +193,7 @@ def process_job_sync(jid, source_url):
             choice = ((0, 0), chosen, MAX_BYTES)
         else:
             job["status"] = "analyzing URL"
-            job["log"] = "Extracting media metadata via yt-dlp..."
+            job["log"] = f"Extracting media metadata via yt-dlp {'(via Proxy)' if job_proxy else ''}..."
 
             opts = {
                 "quiet": True,
@@ -200,8 +202,8 @@ def process_job_sync(jid, source_url):
                 "skip_download": True,
                 "http_headers": custom_headers if custom_headers else None
             }
-            if PROXY:
-                opts["proxy"] = PROXY
+            if job_proxy:
+                opts["proxy"] = job_proxy
             if YT_COOKIES:
                 opts["cookiefile"] = COOKIE_PATH
             if job.get("force_generic"):
@@ -235,9 +237,9 @@ def process_job_sync(jid, source_url):
             quality=f"{vf.get('height') or 'stream'}p ~{int(size / 1e6)} MB",
             title=title_text
         )
-        job["log"] = "Processing video streams with ffmpeg..."
+        job["log"] = f"Processing video streams with ffmpeg {'(via Proxy)' if job_proxy else ''}..."
 
-        cmd = build_ffmpeg_cmd(chosen, out_path, enc, extra_headers=custom_headers)
+        cmd = build_ffmpeg_cmd(chosen, out_path, enc, extra_headers=custom_headers, proxy=job_proxy)
         proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
 
         while proc.poll() is None:
@@ -329,6 +331,7 @@ class Req(BaseModel):
     custom_title: str = ""
     direct_mode: bool = False
     force_generic: bool = False
+    use_proxy: bool = False
 
 
 @app.get("/api/jobs")
@@ -362,7 +365,8 @@ async def create(req: Req):
         "user_agent": req.user_agent.strip(),
         "custom_title": req.custom_title.strip(),
         "direct_mode": req.direct_mode,
-        "force_generic": req.force_generic
+        "force_generic": req.force_generic,
+        "use_proxy": req.use_proxy
     }
     await JOB_QUEUE.put(jid)
     return {"id": jid}
@@ -591,6 +595,11 @@ def home():
     </button>
   </div>
   
+  <label class="checkbox-label" style="font-weight: 600; margin-top: .6rem;">
+    <input type="checkbox" id="useProxy">
+    🌐 Use Mobile Residential Proxy (Every Proxy / Ngrok)
+  </label>
+
   <details>
     <summary>⚡ Advanced / Unsupported Site Controls</summary>
     <div class="adv-option">
@@ -684,6 +693,7 @@ async function submitJob() {
   const ctitle = document.getElementById('ctitle');
   const directMode = document.getElementById('directMode');
   const forceGeneric = document.getElementById('forceGeneric');
+  const useProxy = document.getElementById('useProxy');
 
   if(!u.value.trim()) return;
   
@@ -698,7 +708,8 @@ async function submitJob() {
     user_agent: ua.value.trim(),
     custom_title: ctitle.value.trim(),
     direct_mode: directMode.checked,
-    force_generic: forceGeneric.checked
+    force_generic: forceGeneric.checked,
+    use_proxy: useProxy.checked
   };
 
   const r = await fetch('/api/jobs', {
@@ -714,6 +725,7 @@ async function submitJob() {
     ctitle.value = '';
     directMode.checked = false;
     forceGeneric.checked = false;
+    useProxy.checked = false;
     updateInputActionIcon();
     fetchQueue();
   } else {
@@ -811,7 +823,10 @@ async function fetchQueue() {
             </button>
           </div>
           <div class="card active" id="card-el-${j.id}" style="${transformStyle}" ontouchstart="handleTouchStart(event, '${j.id}')" ontouchmove="handleTouchMove(event, '${j.id}')" ontouchend="handleTouchEnd(event, '${j.id}')">
-            <div><span class="badge badge-active">${escapeHtml(j.status)}</span></div>
+            <div>
+              <span class="badge badge-active">${escapeHtml(j.status)}</span>
+              ${j.use_proxy ? '<span class="badge badge-queued" style="margin-left:4px">PROXY ON</span>' : ''}
+            </div>
             <div style="margin-top:.4rem"><b>${escapeHtml(j.title || j.source_url)}</b></div>
             ${j.quality ? '<div>Quality: ' + escapeHtml(j.quality) + '</div>' : ''}
             <div>Size: ${sizeStr}</div>
@@ -835,7 +850,10 @@ async function fetchQueue() {
             </button>
           </div>
           <div class="card queued" id="card-el-${j.id}" style="${transformStyle}" ontouchstart="handleTouchStart(event, '${j.id}')" ontouchmove="handleTouchMove(event, '${j.id}')" ontouchend="handleTouchEnd(event, '${j.id}')">
-            <div><span class="badge badge-queued">Queue Position #${idx + 1}</span></div>
+            <div>
+              <span class="badge badge-queued">Queue Position #${idx + 1}</span>
+              ${j.use_proxy ? '<span class="badge badge-queued" style="margin-left:4px">PROXY ON</span>' : ''}
+            </div>
             <div style="margin-top:.4rem;word-break:break-all"><b>${escapeHtml(j.source_url)}</b></div>
             <button class="cancel" onclick="cancelJob('${j.id}')">Remove from Queue</button>
           </div>
@@ -863,7 +881,10 @@ async function fetchQueue() {
             </button>
           </div>
           <div class="card ${j.status}" id="card-el-${j.id}" style="${transformStyle}" ontouchstart="handleTouchStart(event, '${j.id}')" ontouchmove="handleTouchMove(event, '${j.id}')" ontouchend="handleTouchEnd(event, '${j.id}')">
-            <div><span class="badge ${bClass}">${escapeHtml(j.status)}</span></div>
+            <div>
+              <span class="badge ${bClass}">${escapeHtml(j.status)}</span>
+              ${j.use_proxy ? '<span class="badge badge-queued" style="margin-left:4px">PROXY ON</span>' : ''}
+            </div>
             <div style="margin-top:.3rem"><b>${escapeHtml(j.title || j.source_url)}</b></div>
             ${j.result_url ? '<div class="url-row"><a href="' + escapeHtml(j.result_url) + '" target="_blank">' + escapeHtml(j.result_url) + '</a>' + copyBtn + '</div>' : ''}
             ${j.error ? '<div style="color:#c0392b;font-size:.85rem;margin-top:.3rem">' + escapeHtml(j.error) + '</div>' : ''}
