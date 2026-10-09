@@ -198,6 +198,13 @@ async def trigger_ytdlp_update():
         raise HTTPException(500, f"Update failed: {str(e)}")
 
 
+def normalize_ver(v: str) -> str:
+    """Removes leading zeros from version segments so 2026.08.19 matches 2026.8.19."""
+    if not v:
+        return ""
+    return ".".join(str(int(part)) if part.isdigit() else part for part in v.strip().lstrip("v").split("."))
+
+
 @app.get("/api/version")
 def get_version():
     """Checks PyPI to see if the installed version is up to date."""
@@ -207,7 +214,7 @@ def get_version():
         r = requests.get("https://pypi.org/pypi/yt-dlp/json", timeout=3)
         if r.status_code == 200:
             latest_version = r.json().get("info", {}).get("version", CURRENT_YTDLP_VERSION)
-            is_latest = (CURRENT_YTDLP_VERSION == latest_version)
+            is_latest = (normalize_ver(CURRENT_YTDLP_VERSION) == normalize_ver(latest_version))
     except Exception:
         pass
 
@@ -1002,6 +1009,17 @@ function updateInputActionIcon() {{
   }}
 }}
 
+async function triggerUpdate() {{
+  const el = document.getElementById('ytdlpTag');
+  if(el) el.innerHTML = 'yt-dlp <span style="color:#0066cc">Updating...</span>';
+  try {{
+    const res = await fetch('/api/update-ytdlp', {{method: 'POST'}});
+    if(res.ok) {{
+      fetchVersion();
+    }}
+  }} catch(e) {{}}
+}}
+
 async function fetchVersion() {{
   try {{
     const res = await fetch('/api/version');
@@ -1010,9 +1028,9 @@ async function fetchVersion() {{
       const el = document.getElementById('ytdlpTag');
       if(el && data.current_version) {{
         if(data.is_latest) {{
-          el.innerHTML = 'yt-dlp v' + escapeHtml(data.current_version) + ' <span style="color:#27ae60;font-weight:600">(Up to date)</span>';
+          el.innerHTML = '<span onclick="triggerUpdate()" style="cursor:pointer" title="Click to force update">yt-dlp v' + escapeHtml(data.current_version) + ' <span style="color:#27ae60;font-weight:600">(Up to date)</span></span>';
         }} else {{
-          el.innerHTML = 'yt-dlp v' + escapeHtml(data.current_version) + ' <span style="color:#e67e22;font-weight:600">(Update available: v' + escapeHtml(data.latest_version) + ')</span>';
+          el.innerHTML = '<span onclick="triggerUpdate()" style="cursor:pointer" title="Click to update now">yt-dlp v' + escapeHtml(data.current_version) + ' <span style="color:#e67e22;font-weight:600">(Update available: v' + escapeHtml(data.latest_version) + ')</span></span>';
         }}
       }}
     }}
