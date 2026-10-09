@@ -1,8 +1,8 @@
-"""yt-dlp -> ffmpeg (pipe) -> catbox.moe. Nothing is written to disk."""
-import io
+"""yt-dlp -> ffmpeg (pipe) -> catbox.moe. Nothing is written to disk except temp stream file."""
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -16,7 +16,6 @@ MAX_BYTES = int(float(os.getenv("MAX_MB", "190")) * 1_000_000)   # target ceilin
 HARD_BYTES = 199_000_000                                          # abort above this
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "")
 USERHASH = os.getenv("CATBOX_USERHASH", "")
-BUFFER_IN_RAM = os.getenv("BUFFER_IN_RAM", "0") == "1"
 CATBOX = "https://catbox.moe/user/api.php"
 PROXY = os.getenv("PROXY", "")
 YT_COOKIES = os.getenv("YT_COOKIES", "")
@@ -32,19 +31,17 @@ SEM = threading.Semaphore(int(os.getenv("MAX_CONCURRENT", "1")))
 
 
 def est_size(f, dur):
-    """Calculate file size in bytes or fallback to estimated bitrate math."""
     s = f.get("filesize") or f.get("filesize_approx")
     if s:
         return s
     br = f.get("tbr") or ((f.get("vbr") or 0) + (f.get("abr") or 0))
     if br:
-        d = dur if (dur and dur > 0) else 180  # Default to 3 mins if duration is missing/0
+        d = dur if (dur and dur > 0) else 180
         return int(br * 1000 / 8 * d)
     return 0
 
 
 def pick(info):
-    """Select the best progressive or separate video+audio streams fitting MAX_BYTES."""
     dur = info.get("duration") or 0
     fmts = [f for f in info.get("formats", []) if f.get("url") and f.get("protocol") != "mhtml"]
     
@@ -54,15 +51,12 @@ def pick(info):
     
     aud.sort(key=lambda f: f.get("abr") or f.get("tbr") or 0, reverse=True)
 
-    cands = []  # (height, bitrate, [formats], calculated_size)
-
-    # 1. Progressive streams
+    cands = []
     for p in prog:
         s = est_size(p, dur)
         if 0 < s <= MAX_BYTES:
             cands.append((p.get("height") or 0, p.get("tbr") or 0, [p], s))
 
-    # 2. Separate Video + Audio streams
     for v in vid:
         vs = est_size(v, dur)
         for a in aud:
@@ -70,14 +64,13 @@ def pick(info):
             tot = vs + as_
             if 0 < tot <= MAX_BYTES:
                 cands.append((v.get("height") or 0, v.get("tbr") or 0, [v, a], tot))
-                break  # Best audio that fits with this video format
+                break
 
     if cands:
         cands.sort(key=lambda c: (c[0], c[1]), reverse=True)
         best = cands[0]
         return (best[0], best[1]), best[2], best[3]
 
-    # 3. Fallback when size is completely unknown (or dur == 0): Grab lowest available <= 720p stream
     low_prog = [p for p in prog if (p.get("height") or 0) <= 720]
     if low_prog:
         low_prog.sort(key=lambda f: f.get("height") or 0)
@@ -88,20 +81,19 @@ def pick(info):
         low_vid.sort(key=lambda f: f.get("height") or 0)
         chosen = [low_vid[0]]
         if aud:
-            chosen.append(aud[-1])  # Lowest bitrate audio
+            chosen.append(aud[-1])
         return ((0, 0), chosen, MAX_BYTES)
 
     return None
 
 
 def plan_transcode(info):
-    """Determine bitrate and target height for re-encoding if direct copying won't fit."""
     dur = info.get("duration")
     if not dur or dur <= 0:
-        dur = 180  # Assume 3 minutes if duration is missing
+        dur = 180
 
     abr = 96
-    total_kbps = MAX_BYTES * 0.92 * 8 / dur / 1000  # 8% safety buffer
+    total_kbps = MAX_BYTES * 0.92 * 8 / dur / 1000
     vbr = int(total_kbps - abr)
     
     target_h = 240
@@ -197,49 +189,37 @@ def run_job(jid, url):
                        title=info.get("title"))
 
             name = re.sub(r"[^A-Za-z0-9_\- ]", "", info.get("title") or "")[:80].strip() or "video"
-            boundary = uuid.uuid4().hex
-            pre = (f'--{boundary}\r\nContent-Disposition: form-data; name="reqtype"\r\n\r\nfileupload\r\n'
-                   + (f'--{boundary}\r\nContent-Disposition: form-data; name="userhash"\r\n\r\n{USERHASH}\r\n' if USERHASH else "")
-                   + f'--{boundary}\r\nContent-Disposition: form-data; name="fileToUpload"; filename="{name}.mp4"\r\n'
-                     f'Content-Type: video/mp4\r\n\r\n').encode()
-            post = f"\r\n--{boundary}--\r\n".encode()
-            headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
 
+            # Execute ffmpeg to pipe output directly to a temporary file
             proc = subprocess.Popen(build_cmd(chosen, enc), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             sent = 0
 
-            def chunks():
-                nonlocal sent
+            with tempfile.TemporaryFile() as tmp:
                 while True:
                     c = proc.stdout.read(1 << 20)
                     if not c:
-                        return
+                        break
                     sent += len(c)
                     job["bytes"] = sent
                     if sent > HARD_BYTES:
                         proc.kill()
                         raise RuntimeError("Output exceeded the 200 MB limit; aborted.")
-                    yield c
+                    tmp.write(c)
 
-            if BUFFER_IN_RAM:
-                buf = io.BytesIO()
-                buf.write(pre)
-                for c in chunks():
-                    buf.write(c)
-                buf.write(post)
                 if proc.wait() != 0:
                     raise RuntimeError("ffmpeg failed: " + proc.stderr.read().decode()[-300:])
-                buf.seek(0)
+
+                tmp.seek(0)
                 job["status"] = "uploading"
-                r = requests.post(CATBOX, data=buf, headers=headers, timeout=900)
-            else:
-                def body():
-                    yield pre
-                    yield from chunks()
-                    yield post
-                r = requests.post(CATBOX, data=body(), headers=headers, timeout=900)
-                if proc.wait() != 0:
-                    raise RuntimeError("ffmpeg failed mid-stream: " + proc.stderr.read().decode()[-300:])
+
+                payload = {
+                    "reqtype": (None, "fileupload"),
+                    "fileToUpload": (f"{name}.mp4", tmp, "video/mp4")
+                }
+                if USERHASH:
+                    payload["userhash"] = (None, USERHASH)
+
+                r = requests.post(CATBOX, files=payload, timeout=900)
 
             out = r.text.strip()
             if not out.startswith("http"):
