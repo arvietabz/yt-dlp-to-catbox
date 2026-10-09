@@ -38,20 +38,18 @@ def process_job_sync(jid, source_url):
             job["status"] = "analyzing URL"
             job["log"] = f"Extracting media metadata via yt-dlp {'(via Proxy)' if job_proxy else ''}..."
 
+            # Always set YouTube mobile client fallback regardless of custom cookies
             opts = {
                 "quiet": True,
                 "no_warnings": True,
                 "noplaylist": True,
                 "skip_download": True,
-            }
-
-            # If no custom cookies are provided, use fallback mobile clients
-            if not job.get("cookies"):
-                opts["extractor_args"] = {
+                "extractor_args": {
                     "youtube": {
                         "player_client": ["android", "ios"]
                     }
                 }
+            }
 
             # Parse custom extractor args (e.g. generic:impersonate)
             if job.get("custom_args"):
@@ -59,9 +57,6 @@ def process_job_sync(jid, source_url):
                     from yt_dlp.utils import parse_map_param
                     raw_args = [a for a in re.split(r'[\s;]+', job["custom_args"]) if a]
                     parsed_args = parse_map_param(raw_args)
-                    
-                    if "extractor_args" not in opts:
-                        opts["extractor_args"] = {}
 
                     for ext_key, ext_val in parsed_args.items():
                         if ext_key in opts["extractor_args"]:
