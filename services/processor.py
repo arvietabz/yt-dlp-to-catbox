@@ -129,6 +129,7 @@ def build_ffmpeg_cmd(chosen, out_path, enc=None, extra_headers=None, proxy=None)
 def process_job_sync(jid, source_url):
     job = state.JOBS[jid]
     out_path = f"/tmp/{jid}.mp4"
+    job_cookie_path = None
     proc = None
     try:
         if job.get("cancelled"):
@@ -169,8 +170,15 @@ def process_job_sync(jid, source_url):
                 opts["http_headers"] = custom_headers
             if job_proxy:
                 opts["proxy"] = job_proxy
-            if YT_COOKIES:
+
+            if job.get("cookies"):
+                job_cookie_path = f"/tmp/{jid}_cookies.txt"
+                with open(job_cookie_path, "w", encoding="utf-8") as _cf:
+                    _cf.write(job["cookies"])
+                opts["cookiefile"] = job_cookie_path
+            elif YT_COOKIES:
                 opts["cookiefile"] = COOKIE_PATH
+
             if job.get("force_generic"):
                 opts["force_generic_extractor"] = True
 
@@ -239,7 +247,6 @@ def process_job_sync(jid, source_url):
                 
                 dl_pct = job.get("download_pct")
                 if dl_pct and dl_pct > 0.5:
-                    # Dynamically update real-time projected total size
                     job["total_size"] = int(curr_size / (dl_pct / 100.0))
 
                 if dl_pct is not None:
@@ -339,6 +346,11 @@ def process_job_sync(jid, source_url):
         if os.path.exists(out_path):
             try:
                 os.remove(out_path)
+            except Exception:
+                pass
+        if job_cookie_path and os.path.exists(job_cookie_path):
+            try:
+                os.remove(job_cookie_path)
             except Exception:
                 pass
 
