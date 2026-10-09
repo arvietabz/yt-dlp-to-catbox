@@ -4,9 +4,11 @@ services:
     runtime: docker
     plan: free
     envVars:
-      - key: ACCESS_TOKEN   # set this so strangers can't use your server
-        sync: false
-      - key: CATBOX_USERHASH  # optional
+      - key: ACCESS_TOKEN
         sync: false
       - key: MAX_MB
-        value: "190"
+        value: "1000"
+      - key: TAILSCALE_AUTHKEY
+        sync: false
+      - key: PROXY
+        sync: false
