@@ -1,5 +1,7 @@
-"""yt-dlp -> ffmpeg -> native Python HTTP upload (Litterbox 1GB / 1h expiry).
-FastAPI Server with Async Queue, Interactive Input Controls, & Mobile UI Dashboard.
+"""
+yt-dlp -> ffmpeg -> native Python HTTP upload (Litterbox 1GB / 1h expiry).
+FastAPI Server with Async Queue, Advanced Extraction Options, & Mobile UI Dashboard.
+File: app.py
 """
 import asyncio
 import os
@@ -126,14 +128,17 @@ def plan_transcode(info):
     return chosen, {"vbr": vbr, "abr": abr, "scale": scale}, MAX_BYTES, target_h
 
 
-def build_ffmpeg_cmd(chosen, out_path, enc=None):
+def build_ffmpeg_cmd(chosen, out_path, enc=None, extra_headers=None):
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-nostdin"]
     for f in chosen:
-        hdr = "".join(f"{k}: {v}\r\n" for k, v in (f.get("http_headers") or {}).items())
+        merged_headers = {**(f.get("http_headers") or {}), **(extra_headers or {})}
+        hdr = "".join(f"{k}: {v}\r\n" for k, v in merged_headers.items())
         if PROXY:
             cmd += ["-http_proxy", PROXY]
-        cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-                "-headers", hdr, "-i", f["url"]]
+        cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+        if hdr:
+            cmd += ["-headers", hdr]
+        cmd += ["-i", f["url"]]
 
     if len(chosen) == 2:
         cmd += ["-map", "0:v:0", "-map", "1:a:0"]
@@ -161,30 +166,61 @@ def process_job_sync(jid, source_url):
         if job.get("cancelled"):
             raise RuntimeError("Job cancelled by user.")
 
-        job["status"] = "analyzing URL"
-        job["log"] = "Extracting media metadata via yt-dlp..."
+        custom_headers = {}
+        if job.get("referer"):
+            custom_headers["Referer"] = job["referer"]
+        if job.get("user_agent"):
+            custom_headers["User-Agent"] = job["user_agent"]
 
-        opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}
-        if PROXY:
-            opts["proxy"] = PROXY
-        if YT_COOKIES:
-            opts["cookiefile"] = COOKIE_PATH
-
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(source_url, download=False)
-
-        if job.get("cancelled"):
-            raise RuntimeError("Job cancelled by user.")
-
-        choice = pick(info)
+        choice = None
         enc = None
+        info = {}
 
-        if not choice and os.getenv("ALLOW_TRANSCODE", "1") == "1":
-            plan = plan_transcode(info)
-            if plan:
-                chosen, enc, size, th = plan
-                choice = ((0, 0), chosen, size)
-                job["note"] = f"re-encoding to {min(th, chosen[0].get('height') or th)}p to fit"
+        # DIRECT MODE: Skip yt-dlp entirely and stream URL straight into FFmpeg
+        if job.get("direct_mode"):
+            job["status"] = "direct streaming"
+            job["log"] = "Bypassing yt-dlp, passing stream directly to FFmpeg..."
+            chosen = [{
+                "url": source_url,
+                "http_headers": custom_headers,
+                "height": 0,
+                "acodec": "aac",
+                "vcodec": "h264"
+            }]
+            info = {"title": job.get("custom_title") or "Direct Stream Video"}
+            choice = ((0, 0), chosen, MAX_BYTES)
+        else:
+            job["status"] = "analyzing URL"
+            job["log"] = "Extracting media metadata via yt-dlp..."
+
+            opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "skip_download": True,
+                "http_headers": custom_headers if custom_headers else None
+            }
+            if PROXY:
+                opts["proxy"] = PROXY
+            if YT_COOKIES:
+                opts["cookiefile"] = COOKIE_PATH
+            if job.get("force_generic"):
+                opts["force_generic_extractor"] = True
+
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(source_url, download=False)
+
+            if job.get("cancelled"):
+                raise RuntimeError("Job cancelled by user.")
+
+            choice = pick(info)
+
+            if not choice and os.getenv("ALLOW_TRANSCODE", "1") == "1":
+                plan = plan_transcode(info)
+                if plan:
+                    chosen, enc, size, th = plan
+                    choice = ((0, 0), chosen, size)
+                    job["note"] = f"re-encoding to {min(th, chosen[0].get('height') or th)}p to fit"
 
         if not choice:
             d = info.get("duration") or 0
@@ -192,14 +228,16 @@ def process_job_sync(jid, source_url):
 
         _, chosen, size = choice
         vf = chosen[0]
+        title_text = job.get("custom_title") or info.get("title") or "Unsupported Video Stream"
+        
         job.update(
             status="downloading & processing",
-            quality=f"{vf.get('height') or 'unknown'}p ~{int(size / 1e6)} MB",
-            title=info.get("title")
+            quality=f"{vf.get('height') or 'stream'}p ~{int(size / 1e6)} MB",
+            title=title_text
         )
         job["log"] = "Processing video streams with ffmpeg..."
 
-        cmd = build_ffmpeg_cmd(chosen, out_path, enc)
+        cmd = build_ffmpeg_cmd(chosen, out_path, enc, extra_headers=custom_headers)
         proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
 
         while proc.poll() is None:
@@ -228,10 +266,10 @@ def process_job_sync(jid, source_url):
         job.update(status="uploading to litterbox (1h expiry)", total_size=final_size, bytes=final_size)
         job["log"] = f"File processed ({final_size / 1e6:.1f} MB). Dispatching HTTP upload..."
 
-        clean_title = re.sub(r"[^A-Za-z0-9_\- ]", "", info.get("title") or "")[:60].strip() or "video"
+        clean_title = re.sub(r"[^A-Za-z0-9_\- ]", "", title_text)[:60].strip() or "video"
         
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": job.get("user_agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
         data = {
             "reqtype": "fileupload",
@@ -286,6 +324,11 @@ async def startup_event():
 class Req(BaseModel):
     url: str = ""
     token: str = ""
+    referer: str = ""
+    user_agent: str = ""
+    custom_title: str = ""
+    direct_mode: bool = False
+    force_generic: bool = False
 
 
 @app.get("/api/jobs")
@@ -314,7 +357,12 @@ async def create(req: Req):
         "bytes": 0,
         "log": "Queued for processing...",
         "t": time.time(),
-        "cancelled": False
+        "cancelled": False,
+        "referer": req.referer.strip(),
+        "user_agent": req.user_agent.strip(),
+        "custom_title": req.custom_title.strip(),
+        "direct_mode": req.direct_mode,
+        "force_generic": req.force_generic
     }
     await JOB_QUEUE.put(jid)
     return {"id": jid}
@@ -392,6 +440,40 @@ def home():
   }
   .input-action-btn:hover {
     color: #222;
+  }
+
+  details {
+    margin: .6rem 0;
+    border: 1px dashed #bbb;
+    border-radius: 6px;
+    padding: .5rem .8rem;
+    background: #fafafa;
+  }
+  summary {
+    font-weight: 600;
+    font-size: .85rem;
+    color: #444;
+    cursor: pointer;
+  }
+  .adv-option {
+    margin-top: .4rem;
+  }
+  .adv-option input {
+    padding: .5rem;
+    font-size: .85rem;
+  }
+  .checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: .85rem;
+    color: #333;
+    margin: .4rem 0;
+    cursor: pointer;
+  }
+  .checkbox-label input {
+    width: auto !important;
+    margin: 0 !important;
   }
 
   .swipe-container {
@@ -503,11 +585,29 @@ def home():
 <h2>Video → Litterbox (1h Expiry / 1 GB Limit)</h2>
 <div class="card" style="z-index:1">
   <div class="input-wrapper">
-    <input id="u" placeholder="Video URL">
+    <input id="u" placeholder="Video URL or .m3u8 Stream">
     <button id="inputActionBtn" class="input-action-btn" type="button" onclick="handleInputAction()" title="Paste">
       <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 012 2v14a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect></svg>
     </button>
   </div>
+  
+  <details>
+    <summary>⚡ Advanced / Unsupported Site Controls</summary>
+    <div class="adv-option">
+      <input id="ref" placeholder="Referer URL (e.g. https://site.com/embed)">
+      <input id="ua" placeholder="User-Agent Header (optional)">
+      <input id="ctitle" placeholder="Custom Output Filename (optional)">
+      <label class="checkbox-label">
+        <input type="checkbox" id="directMode">
+        Direct Stream / M3U8 (Bypass yt-dlp)
+      </label>
+      <label class="checkbox-label">
+        <input type="checkbox" id="forceGeneric">
+        Force Generic Extractor (--force-generic-extractor)
+      </label>
+    </div>
+  </details>
+
   <input id="t" placeholder="Access token (if set)" type="password">
   <button onclick="submitJob()">Upload to Queue</button>
 </div>
@@ -579,20 +679,41 @@ window.addEventListener('DOMContentLoaded', () => {
 async function submitJob() {
   const u = document.getElementById('u');
   const t = document.getElementById('t');
+  const ref = document.getElementById('ref');
+  const ua = document.getElementById('ua');
+  const ctitle = document.getElementById('ctitle');
+  const directMode = document.getElementById('directMode');
+  const forceGeneric = document.getElementById('forceGeneric');
+
   if(!u.value.trim()) return;
   
   if(t.value.trim()) {
     localStorage.setItem('access_token', t.value.trim());
   }
 
+  const payload = {
+    url: u.value.trim(),
+    token: t.value.trim(),
+    referer: ref.value.trim(),
+    user_agent: ua.value.trim(),
+    custom_title: ctitle.value.trim(),
+    direct_mode: directMode.checked,
+    force_generic: forceGeneric.checked
+  };
+
   const r = await fetch('/api/jobs', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({url: u.value.trim(), token: t.value.trim()})
+    body: JSON.stringify(payload)
   });
   
   if(r.ok) {
     u.value = '';
+    ref.value = '';
+    ua.value = '';
+    ctitle.value = '';
+    directMode.checked = false;
+    forceGeneric.checked = false;
     updateInputActionIcon();
     fetchQueue();
   } else {
