@@ -98,7 +98,8 @@ def plan_transcode(info):
     return chosen, {"vbr": vbr, "abr": abr, "scale": scale}, MAX_BYTES, target_h
 
 def build_ffmpeg_cmd(chosen, out_path, enc=None, extra_headers=None, proxy=None):
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-nostdin"]
+    # Added -progress pipe:2 to stream real-time progress metrics to stderr
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-progress", "pipe:2", "-y", "-nostdin"]
     for f in chosen:
         merged_headers = {**(f.get("http_headers") or {}), **(extra_headers or {})}
         hdr = "".join(f"{k}: {v}\r\n" for k, v in merged_headers.items())
@@ -208,27 +209,29 @@ def process_job_sync(jid, source_url):
         cmd = build_ffmpeg_cmd(chosen, out_path, enc, extra_headers=custom_headers, proxy=job_proxy)
         proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, bufsize=1)
 
-        buffer = ""
-        while proc.poll() is None:
-            time.sleep(0.05)
+        stderr_logs = []
+        while True:
+            line = proc.stderr.readline() if proc.stderr else ""
+            if not line:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.01)
+                continue
+
+            stderr_logs.append(line)
+            if len(stderr_logs) > 50:
+                stderr_logs.pop(0)
+
             if job.get("cancelled"):
                 proc.kill()
                 raise RuntimeError("Job cancelled by user.")
 
-            # Read stderr character by character to catch real-time FFmpeg progress
-            char = proc.stderr.read(1) if proc.stderr else ""
-            if char:
-                if char in ("\r", "\n"):
-                    line = buffer.strip()
-                    buffer = ""
-                    match = re.search(r"time=(\d+):(\d+):(\d+\.\d+|\d+)", line)
-                    if match and total_duration > 0:
-                        h, m, s = float(match.group(1)), float(match.group(2)), float(match.group(3))
-                        curr_sec = h * 3600 + m * 60 + s
-                        pct = min(99.9, (curr_sec / total_duration) * 100)
-                        job["download_pct"] = round(pct, 1)
-                else:
-                    buffer += char
+            match = re.search(r"(?:out_time|time)=(\d+):(\d+):(\d+\.\d+|\d+)", line)
+            if match and total_duration > 0:
+                h, m, s = float(match.group(1)), float(match.group(2)), float(match.group(3))
+                curr_sec = h * 3600 + m * 60 + s
+                pct = min(99.9, (curr_sec / total_duration) * 100)
+                job["download_pct"] = round(pct, 1)
 
             if os.path.exists(out_path):
                 curr_size = os.path.getsize(out_path)
@@ -245,7 +248,7 @@ def process_job_sync(jid, source_url):
                     raise RuntimeError("File size exceeded 1 GB ceiling during processing; aborted.")
 
         if proc.returncode != 0:
-            err_msg = proc.stderr.read()[-400:] if proc.stderr else ""
+            err_msg = "".join(stderr_logs)[-400:]
             raise RuntimeError(f"FFmpeg failed (exit code {proc.returncode}): {err_msg}")
 
         if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
