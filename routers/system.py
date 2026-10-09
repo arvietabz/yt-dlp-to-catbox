@@ -79,10 +79,21 @@ def test_proxy():
             "details": str(e)
         }
 
+@router.get("/debug-url-test")
 @router.get("/debug-url")
 def debug_url(url: str, use_proxy: bool = True):
     job_proxy = PROXY if use_proxy else ""
-    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web", "mweb"]
+            }
+        }
+    }
     if job_proxy:
         opts["proxy"] = job_proxy
     if YT_COOKIES:
