@@ -235,7 +235,7 @@ def run_job(jid, url):
                 job.update(status="uploading to catbox", total_size=actual_file_size)
 
                 data = {"reqtype": "fileupload"}
-                if USERHASH and re.match(r"^[a-f0-9]+$", USERHASH, re.IGNORECASE):
+                if USERHASH and len(USERHASH) == 30 and re.match(r"^[a-f0-9]+$", USERHASH, re.IGNORECASE):
                     data["userhash"] = USERHASH
 
                 wrapped_file = ProgressFileReader(tmp, job)
@@ -243,11 +243,7 @@ def run_job(jid, url):
                     "fileToUpload": (f"{name}.mp4", wrapped_file, "video/mp4")
                 }
 
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                }
-
-                r = requests.post(CATBOX, data=data, files=files, headers=headers, timeout=(30, 600))
+                r = requests.post(CATBOX, data=data, files=files, timeout=(30, 600))
 
             out = r.text.strip()
             if not out.startswith("http"):
