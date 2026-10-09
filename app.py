@@ -485,27 +485,29 @@ def process_job_sync(jid, source_url):
         job["log"] = f"File processed ({final_size / 1e6:.1f} MB). Dispatching HTTP upload..."
 
         clean_title = re.sub(r"[^A-Za-z0-9_\- ]", "", title_text)[:60].strip() or "video"
-        
-        headers = {
-            "User-Agent": job.get("user_agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        data = {
-            "reqtype": "fileupload",
-            "time": "1h"
-        }
+        ua = job.get("user_agent") or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-        with open(out_path, "rb") as f:
-            files = {
-                "fileToUpload": (f"{clean_title}.mp4", f, "video/mp4")
-            }
-            r = requests.post(LITTERBOX_URL, data=data, files=files, headers=headers, timeout=(30, 1200))
+        # Native streaming cURL upload to prevent Python RAM buffering & OOM crashes on Render
+        curl_cmd = [
+            "curl", "-s", "-S",
+            "-A", ua,
+            "-F", "reqtype=fileupload",
+            "-F", "time=1h",
+            "-F", f"fileToUpload=@{out_path};filename={clean_title}.mp4",
+            LITTERBOX_URL
+        ]
+
+        upload_proc = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=1200)
+
+        if upload_proc.returncode != 0:
+            raise RuntimeError(f"cURL upload failed (exit {upload_proc.returncode}): {upload_proc.stderr}")
 
         if job.get("cancelled"):
             raise RuntimeError("Job cancelled by user.")
 
-        out_url = r.text.strip()
+        out_url = upload_proc.stdout.strip()
         if not out_url.startswith("http"):
-            raise RuntimeError(f"Litterbox response error [HTTP {r.status_code}]: '{out_url[:200]}'")
+            raise RuntimeError(f"Litterbox response error: '{out_url[:200]}'")
 
         job.update(status="done", result_url=out_url, log="Upload completed successfully!")
 
