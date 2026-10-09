@@ -1,5 +1,5 @@
 """yt-dlp -> ffmpeg -> native Python HTTP upload (Litterbox 1GB / 1h expiry).
-FastAPI Server with Async Queue, Native HTTP Uploads, Global State & UI Queue Dashboard.
+FastAPI Server with Async Queue, Native HTTP Uploads, Global State & Interactive UI Dashboard.
 """
 import asyncio
 import os
@@ -304,7 +304,6 @@ async def create(req: Req):
     if not re.match(r"^https?://", req.url):
         raise HTTPException(400, "invalid url")
     
-    # Retain up to 30 recent jobs in history
     for k in list(JOBS)[:-30]:
         JOBS.pop(k, None)
         
@@ -334,6 +333,22 @@ def cancel_job(jid: str):
     return {"status": "cancelled"}
 
 
+@app.delete("/api/jobs/{jid}")
+def delete_job(jid: str):
+    if jid in JOBS:
+        JOBS.pop(jid, None)
+        return {"status": "deleted"}
+    raise HTTPException(404, "Job not found")
+
+
+@app.post("/api/jobs/clear-history")
+def clear_history():
+    to_remove = [k for k, v in JOBS.items() if v["status"] in ("done", "error", "cancelled")]
+    for k in to_remove:
+        JOBS.pop(k, None)
+    return {"status": "cleared", "count": len(to_remove)}
+
+
 @app.get("/api/jobs/{jid}")
 def get_job(jid: str):
     if jid not in JOBS:
@@ -350,26 +365,115 @@ def home():
   input,button{width:100%;padding:.75rem;margin:.3rem 0;font-size:1rem;box-sizing:border-box;border-radius:6px;border:1px solid #ccc}
   button{background:#0066cc;color:#fff;font-weight:600;border:none;cursor:pointer}
   button:hover{background:#0052a3}
-  button.cancel{background:#d9534f;color:#fff;padding:.4rem .8rem;font-size:.85rem;width:auto;margin-top:.4rem}
-  button.cancel:hover{background:#c9302c}
-  .card{background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:.8rem 1rem;margin:.8rem 0;box-shadow:0 1px 3px rgba(0,0,0,0.05)}
+  
+  .swipe-container {
+    position: relative;
+    overflow: hidden;
+    margin: .8rem 0;
+    border-radius: 8px;
+  }
+  .swipe-action-bg {
+    position: absolute;
+    top: 0; right: 0; bottom: 0; left: 0;
+    background: #d9534f;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    padding-right: 20px;
+    border-radius: 8px;
+    z-index: 1;
+  }
+  .swipe-action-btn {
+    background: transparent !important;
+    border: none !important;
+    color: white !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    width: auto !important;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+  }
+
+  .card{
+    position: relative;
+    z-index: 2;
+    background:#fff;
+    border:1px solid #e0e0e0;
+    border-radius:8px;
+    padding:.8rem 1rem;
+    box-shadow:0 1px 3px rgba(0,0,0,0.05);
+    transition: transform 0.2s ease, margin 0.2s ease;
+  }
   .card.active{border-left:5px solid #0066cc}
   .card.queued{border-left:5px solid #f0ad4e}
   .card.done{border-left:5px solid #5cb85c}
   .card.error,.card.cancelled{border-left:5px solid #d9534f}
+  
   .badge{display:inline-block;padding:.2rem .5rem;font-size:.75rem;font-weight:bold;border-radius:4px;text-transform:uppercase}
   .badge-active{background:#e6f2ff;color:#0066cc}
   .badge-queued{background:#fef5e7;color:#f0ad4e}
   .badge-done{background:#eafaf1;color:#27ae60}
   .badge-error{background:#fadbd8;color:#c0392b}
-  .section-title{font-size:1.1rem;margin:1.2rem 0 .4rem 0;color:#444;border-bottom:1px solid #ddd;padding-bottom:.3rem}
-  pre{white-space:pre-wrap;word-break:break-all;font-size:.85rem;background:#f0f0f0;padding:.5rem;border-radius:4px}
+  
+  .section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin: 1.2rem 0 .4rem 0;
+    border-bottom: 1px solid #ddd;
+    padding-bottom: .3rem;
+  }
+  .section-title{font-size:1.1rem;font-weight:bold;color:#444}
+  
+  .clear-btn {
+    width: auto !important;
+    padding: .25rem .6rem !important;
+    font-size: .8rem !important;
+    background: transparent !important;
+    color: #888 !important;
+    border: 1px solid #ccc !important;
+    border-radius: 4px !important;
+    margin: 0 !important;
+  }
+  .clear-btn:hover {
+    background: #fee !important;
+    color: #c0392b !important;
+    border-color: #f5c6cb !important;
+  }
+
+  button.cancel{background:#d9534f;color:#fff;padding:.4rem .8rem;font-size:.85rem;width:auto;margin-top:.4rem}
+  button.cancel:hover{background:#c9302c}
+
+  .url-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: .4rem;
+  }
+  .copy-btn {
+    width: auto !important;
+    padding: 4px 8px !important;
+    margin: 0 !important;
+    background: #f0f0f0 !important;
+    color: #333 !important;
+    border: 1px solid #ccc !important;
+    border-radius: 4px !important;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .copy-btn:hover {
+    background: #e0e0e0 !important;
+  }
+  
   a{color:#0066cc;text-decoration:none;word-break:break-all}
   a:hover{text-decoration:underline}
 </style>
 
 <h2>Video → Litterbox (1h Expiry / 1 GB Limit)</h2>
-<div class="card">
+<div class="card" style="z-index:1">
   <input id="u" placeholder="Video URL">
   <input id="t" placeholder="Access token (if set)" type="password">
   <button onclick="submitJob()">Upload to Queue</button>
@@ -382,11 +486,29 @@ function escapeHtml(str) {
   return (str || '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
+// LocalStorage Token handling
+window.addEventListener('DOMContentLoaded', () => {
+  const tokenInput = document.getElementById('t');
+  const savedToken = localStorage.getItem('access_token');
+  if(savedToken) tokenInput.value = savedToken;
+  
+  tokenInput.addEventListener('input', () => {
+    localStorage.setItem('access_token', tokenInput.value.trim());
+  });
+
+  fetchQueue();
+  setInterval(fetchQueue, 1500);
+});
+
 async function submitJob() {
   const u = document.getElementById('u');
   const t = document.getElementById('t');
   if(!u.value.trim()) return;
   
+  if(t.value.trim()) {
+    localStorage.setItem('access_token', t.value.trim());
+  }
+
   const r = await fetch('/api/jobs', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -406,6 +528,55 @@ async function cancelJob(jid) {
   fetchQueue();
 }
 
+async function deleteCard(jid) {
+  await fetch('/api/jobs/' + jid, {method: 'DELETE'});
+  fetchQueue();
+}
+
+async function clearAllHistory() {
+  await fetch('/api/jobs/clear-history', {method: 'POST'});
+  fetchQueue();
+}
+
+function copyToClipboard(text, btn) {
+  navigator.clipboard.writeText(text).then(() => {
+    const origHTML = btn.innerHTML;
+    btn.innerHTML = '<span style="font-size:11px;color:#27ae60">✓ Copied</span>';
+    setTimeout(() => btn.innerHTML = origHTML, 1500);
+  });
+}
+
+// Touch / Swipe handling
+let touchState = {};
+
+function handleTouchStart(e, jid) {
+  touchState[jid] = { startX: e.touches[0].clientX, currentX: 0 };
+}
+
+function handleTouchMove(e, jid) {
+  if (!touchState[jid]) return;
+  const diffX = e.touches[0].clientX - touchState[jid].startX;
+  if (diffX < 0 && diffX > -120) {
+    touchState[jid].currentX = diffX;
+    const cardEl = document.getElementById('card-el-' + jid);
+    if (cardEl) cardEl.style.transform = `translateX(${diffX}px)`;
+  }
+}
+
+function handleTouchEnd(e, jid) {
+  if (!touchState[jid]) return;
+  const diffX = touchState[jid].currentX;
+  const cardEl = document.getElementById('card-el-' + jid);
+  if (cardEl) {
+    if (diffX < -50) {
+      cardEl.style.transform = 'translateX(-70px)';
+    } else {
+      cardEl.style.transform = 'translateX(0px)';
+    }
+  }
+  delete touchState[jid];
+}
+
 async function fetchQueue() {
   try {
     const res = await fetch('/api/jobs');
@@ -419,40 +590,68 @@ async function fetchQueue() {
     let html = '';
     
     if(active.length > 0) {
-      html += '<div class="section-title">Currently Processing</div>';
+      html += '<div class="section-header"><div class="section-title">Currently Processing</div></div>';
       active.forEach(j => {
         const sizeStr = j.total_size ? ((j.bytes/1e6).toFixed(1) + '/' + (j.total_size/1e6).toFixed(1) + ' MB') : ((j.bytes/1e6).toFixed(1) + ' MB');
-        html += `<div class="card active">
-          <div><span class="badge badge-active">${escapeHtml(j.status)}</span></div>
-          <div style="margin-top:.4rem"><b>${escapeHtml(j.title || j.source_url)}</b></div>
-          ${j.quality ? '<div>Quality: ' + escapeHtml(j.quality) + '</div>' : ''}
-          <div>Size: ${sizeStr}</div>
-          ${j.log ? '<div style="color:#666;font-size:.85rem;margin-top:.3rem">' + escapeHtml(j.log) + '</div>' : ''}
-          <button class="cancel" onclick="cancelJob('${j.id}')">Cancel Job</button>
+        html += `<div class="swipe-container">
+          <div class="swipe-action-bg">
+            <button class="swipe-action-btn" onclick="deleteCard('${j.id}')">
+              <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6"/></svg>
+            </button>
+          </div>
+          <div class="card active" id="card-el-${j.id}" ontouchstart="handleTouchStart(event, '${j.id}')" ontouchmove="handleTouchMove(event, '${j.id}')" ontouchend="handleTouchEnd(event, '${j.id}')">
+            <div><span class="badge badge-active">${escapeHtml(j.status)}</span></div>
+            <div style="margin-top:.4rem"><b>${escapeHtml(j.title || j.source_url)}</b></div>
+            ${j.quality ? '<div>Quality: ' + escapeHtml(j.quality) + '</div>' : ''}
+            <div>Size: ${sizeStr}</div>
+            ${j.log ? '<div style="color:#666;font-size:.85rem;margin-top:.3rem">' + escapeHtml(j.log) + '</div>' : ''}
+            <button class="cancel" onclick="cancelJob('${j.id}')">Cancel Job</button>
+          </div>
         </div>`;
       });
     }
     
     if(queued.length > 0) {
-      html += '<div class="section-title">Pending Queue (' + queued.length + ')</div>';
+      html += '<div class="section-header"><div class="section-title">Pending Queue (' + queued.length + ')</div></div>';
       queued.forEach((j, idx) => {
-        html += `<div class="card queued">
-          <div><span class="badge badge-queued">Queue Position #${idx + 1}</span></div>
-          <div style="margin-top:.4rem;word-break:break-all"><b>${escapeHtml(j.source_url)}</b></div>
-          <button class="cancel" onclick="cancelJob('${j.id}')">Remove from Queue</button>
+        html += `<div class="swipe-container">
+          <div class="swipe-action-bg">
+            <button class="swipe-action-btn" onclick="deleteCard('${j.id}')">
+              <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6"/></svg>
+            </button>
+          </div>
+          <div class="card queued" id="card-el-${j.id}" ontouchstart="handleTouchStart(event, '${j.id}')" ontouchmove="handleTouchMove(event, '${j.id}')" ontouchend="handleTouchEnd(event, '${j.id}')">
+            <div><span class="badge badge-queued">Queue Position #${idx + 1}</span></div>
+            <div style="margin-top:.4rem;word-break:break-all"><b>${escapeHtml(j.source_url)}</b></div>
+            <button class="cancel" onclick="cancelJob('${j.id}')">Remove from Queue</button>
+          </div>
         </div>`;
       });
     }
     
     if(finished.length > 0) {
-      html += '<div class="section-title">Recent Activity</div>';
-      finished.slice(0, 8).forEach(j => {
+      html += `<div class="section-header">
+        <div class="section-title">Recent Activity</div>
+        <button class="clear-btn" onclick="clearAllHistory()">Clear All</button>
+      </div>`;
+      finished.slice(0, 10).forEach(j => {
         const bClass = j.status === 'done' ? 'badge-done' : 'badge-error';
-        html += `<div class="card ${j.status}">
-          <div><span class="badge ${bClass}">${escapeHtml(j.status)}</span></div>
-          <div style="margin-top:.3rem"><b>${escapeHtml(j.title || j.source_url)}</b></div>
-          ${j.result_url ? '<div style="margin-top:.4rem"><a href="' + escapeHtml(j.result_url) + '" target="_blank">' + escapeHtml(j.result_url) + '</a></div>' : ''}
-          ${j.error ? '<div style="color:#c0392b;font-size:.85rem;margin-top:.3rem">' + escapeHtml(j.error) + '</div>' : ''}
+        const copyBtn = j.result_url ? `<button class="copy-btn" onclick="copyToClipboard('${escapeHtml(j.result_url)}', this)" title="Copy Link">
+          <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+        </button>` : '';
+
+        html += `<div class="swipe-container">
+          <div class="swipe-action-bg">
+            <button class="swipe-action-btn" onclick="deleteCard('${j.id}')">
+              <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6"/></svg>
+            </button>
+          </div>
+          <div class="card ${j.status}" id="card-el-${j.id}" ontouchstart="handleTouchStart(event, '${j.id}')" ontouchmove="handleTouchMove(event, '${j.id}')" ontouchend="handleTouchEnd(event, '${j.id}')">
+            <div><span class="badge ${bClass}">${escapeHtml(j.status)}</span></div>
+            <div style="margin-top:.3rem"><b>${escapeHtml(j.title || j.source_url)}</b></div>
+            ${j.result_url ? '<div class="url-row"><a href="' + escapeHtml(j.result_url) + '" target="_blank">' + escapeHtml(j.result_url) + '</a>' + copyBtn + '</div>' : ''}
+            ${j.error ? '<div style="color:#c0392b;font-size:.85rem;margin-top:.3rem">' + escapeHtml(j.error) + '</div>' : ''}
+          </div>
         </div>`;
       });
     }
@@ -464,9 +663,4 @@ async function fetchQueue() {
     document.getElementById('queueContainer').innerHTML = html;
   } catch(e) {}
 }
-
-window.addEventListener('DOMContentLoaded', () => {
-  fetchQueue();
-  setInterval(fetchQueue, 1500);
-});
 </script>"""
