@@ -1,12 +1,15 @@
 FROM python:3.10-slim
 
-# Install system dependencies including curl, iptables, and tailscale prerequisites
-RUN apt-get update && apt-get install -y \
+# Install system dependencies including curl, iptables, ca-certificates, and ffmpeg
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     iptables \
     ca-certificates \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
+
+# Copy deno JS engine for yt-dlp JavaScript extraction support
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 
 # Install Tailscale binaries
 RUN curl -fsSL https://tailscale.com/install.sh | sh
@@ -25,4 +28,4 @@ COPY . .
 EXPOSE 8080
 
 # Command to run the application
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}"]
