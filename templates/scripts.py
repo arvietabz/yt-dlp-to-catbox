@@ -23,6 +23,37 @@ function updateInputActionIcon() {
   }
 }
 
+function updateCustomArgsUI() {
+  const useCustomArgs = document.getElementById('useCustomArgs');
+  const customArgsWrapper = document.getElementById('customArgsWrapper');
+  const customArgsInput = document.getElementById('customArgsInput');
+  const savedVal = localStorage.getItem('custom_args_val') || '';
+
+  if (customArgsInput && savedVal) {
+    customArgsInput.value = savedVal;
+  }
+
+  if (useCustomArgs && useCustomArgs.checked) {
+    customArgsWrapper.style.display = 'block';
+  } else if (customArgsWrapper) {
+    customArgsWrapper.style.display = 'none';
+  }
+}
+
+function handleCustomArgsCheckboxChange() {
+  const useCustomArgs = document.getElementById('useCustomArgs');
+  if (useCustomArgs.checked) {
+    localStorage.setItem('use_custom_args', 'true');
+  } else {
+    localStorage.setItem('use_custom_args', 'false');
+  }
+  updateCustomArgsUI();
+}
+
+function handleCustomArgsInput(e) {
+  localStorage.setItem('custom_args_val', e.target.value);
+}
+
 function updateCookiesUI() {
   const useCookies = document.getElementById('useCookies');
   const cookiesStatus = document.getElementById('cookiesStatus');
@@ -133,6 +164,13 @@ window.addEventListener('DOMContentLoaded', () => {
   urlInput.addEventListener('input', updateInputActionIcon);
   updateInputActionIcon();
 
+  const useCustomArgs = document.getElementById('useCustomArgs');
+  const isCustomArgsEnabled = localStorage.getItem('use_custom_args') === 'true';
+  if (useCustomArgs) {
+    useCustomArgs.checked = isCustomArgsEnabled;
+    updateCustomArgsUI();
+  }
+
   const useCookies = document.getElementById('useCookies');
   const isCookiesEnabled = localStorage.getItem('use_cookies') === 'true';
   if (isCookiesEnabled && localStorage.getItem('custom_cookies')) {
@@ -160,6 +198,8 @@ async function submitJob() {
   const forceGeneric = document.getElementById('forceGeneric');
   const useProxy = document.getElementById('useProxy');
   const useCookies = document.getElementById('useCookies');
+  const useCustomArgs = document.getElementById('useCustomArgs');
+  const customArgsInput = document.getElementById('customArgsInput');
 
   if(!u.value.trim()) return;
   
@@ -168,6 +208,7 @@ async function submitJob() {
   }
 
   const cookiesText = (useCookies && useCookies.checked) ? (localStorage.getItem('custom_cookies') || '') : '';
+  const customArgsText = (useCustomArgs && useCustomArgs.checked && customArgsInput) ? customArgsInput.value.trim() : '';
 
   const payload = {
     url: u.value.trim(),
@@ -178,7 +219,8 @@ async function submitJob() {
     direct_mode: directMode.checked,
     force_generic: forceGeneric.checked,
     use_proxy: useProxy.checked,
-    cookies: cookiesText
+    cookies: cookiesText,
+    custom_args: customArgsText
   };
 
   const r = await fetch('/api/jobs', {
