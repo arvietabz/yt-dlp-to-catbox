@@ -155,8 +155,16 @@ def process_job_sync(jid, source_url):
             job["log"] = f"Extracting media metadata via yt-dlp {'(via Proxy)' if job_proxy else ''}..."
 
             opts = {
-                "quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True,
-                "http_headers": custom_headers if custom_headers else None
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "skip_download": True,
+                "http_headers": custom_headers if custom_headers else None,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["android", "web", "mweb"]
+                    }
+                }
             }
             if job_proxy:
                 opts["proxy"] = job_proxy
