@@ -88,15 +88,9 @@ def debug_url(url: str, use_proxy: bool = True):
         "no_warnings": True,
         "noplaylist": True,
         "skip_download": True,
-        "impersonate": "chrome",
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9"
-        },
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "mweb", "web"],
-                "player_skip": ["configs", "webpage"]
+                "player_client": ["android", "ios"]
             }
         }
     }
