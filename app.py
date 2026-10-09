@@ -1,5 +1,5 @@
 """yt-dlp -> ffmpeg -> curl (Litterbox 1GB / 1h expiry).
-FastAPI Server with Async Queue & Native cURL Uploads.
+FastAPI Server with Async Queue, Native cURL Uploads, Global State & UI Queue Dashboard.
 """
 import asyncio
 import os
@@ -152,11 +152,15 @@ def build_ffmpeg_cmd(chosen, out_path, enc=None):
     return cmd
 
 
-def process_job_sync(jid, url):
+def process_job_sync(jid, source_url):
     job = JOBS[jid]
     out_path = f"/tmp/{jid}.mp4"
     proc = None
+    curl_proc = None
     try:
+        if job.get("cancelled"):
+            raise RuntimeError("Job cancelled by user.")
+
         job["status"] = "analyzing URL"
         job["log"] = "Extracting media metadata via yt-dlp..."
 
@@ -167,7 +171,10 @@ def process_job_sync(jid, url):
             opts["cookiefile"] = COOKIE_PATH
 
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(source_url, download=False)
+
+        if job.get("cancelled"):
+            raise RuntimeError("Job cancelled by user.")
 
         choice = pick(info)
         enc = None
@@ -197,6 +204,9 @@ def process_job_sync(jid, url):
 
         while proc.poll() is None:
             time.sleep(0.5)
+            if job.get("cancelled"):
+                proc.kill()
+                raise RuntimeError("Job cancelled by user.")
             if os.path.exists(out_path):
                 curr_size = os.path.getsize(out_path)
                 job["bytes"] = curr_size
@@ -210,6 +220,9 @@ def process_job_sync(jid, url):
 
         if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
             raise RuntimeError("FFmpeg completed but produced an empty file.")
+
+        if job.get("cancelled"):
+            raise RuntimeError("Job cancelled by user.")
 
         final_size = os.path.getsize(out_path)
         job.update(status="uploading to litterbox (1h expiry)", total_size=final_size, bytes=final_size)
@@ -225,21 +238,37 @@ def process_job_sync(jid, url):
             LITTERBOX_URL
         ]
 
-        curl_proc = subprocess.run(upload_cmd, capture_output=True, text=True, timeout=1200)
+        curl_proc = subprocess.Popen(upload_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        while curl_proc.poll() is None:
+            time.sleep(0.5)
+            if job.get("cancelled"):
+                curl_proc.kill()
+                raise RuntimeError("Job cancelled by user.")
+
+        out_url, curl_err = curl_proc.communicate()
 
         if curl_proc.returncode != 0:
-            raise RuntimeError(f"cURL upload failed (code {curl_proc.returncode}): {curl_proc.stderr}")
+            raise RuntimeError(f"cURL upload failed (code {curl_proc.returncode}): {curl_err}")
 
-        out_url = curl_proc.stdout.strip()
+        out_url = out_url.strip()
         if not out_url.startswith("http"):
             raise RuntimeError(f"Litterbox response error: '{out_url[:200]}'")
 
-        job.update(status="done", url=out_url, log="Upload completed successfully!")
+        if job.get("cancelled"):
+            raise RuntimeError("Job cancelled by user.")
+
+        job.update(status="done", result_url=out_url, log="Upload completed successfully!")
 
     except Exception as e:
         if proc and proc.poll() is None:
             proc.kill()
-        job.update(status="error", error=str(e)[:400], log=f"Failed: {str(e)[:200]}")
+        if curl_proc and curl_proc.poll() is None:
+            curl_proc.kill()
+
+        if job.get("cancelled"):
+            job.update(status="cancelled", log="Job cancelled by user.", error="")
+        else:
+            job.update(status="error", error=str(e)[:400], log=f"Failed: {str(e)[:200]}")
     finally:
         if os.path.exists(out_path):
             try:
@@ -252,8 +281,8 @@ async def queue_worker():
     while True:
         jid = await JOB_QUEUE.get()
         job = JOBS.get(jid)
-        if job and job["status"] == "queued":
-            await asyncio.to_thread(process_job_sync, jid, job["url"])
+        if job and not job.get("cancelled") and job["status"] == "queued":
+            await asyncio.to_thread(process_job_sync, jid, job["source_url"])
         JOB_QUEUE.task_done()
 
 
@@ -263,8 +292,17 @@ async def startup_event():
 
 
 class Req(BaseModel):
-    url: str
+    url: str = ""
     token: str = ""
+
+
+@app.get("/api/jobs")
+def list_all_jobs():
+    items = []
+    for k, v in JOBS.items():
+        items.append({"id": k, **v})
+    items.sort(key=lambda x: x["t"], reverse=True)
+    return items
 
 
 @app.post("/api/jobs")
@@ -273,16 +311,39 @@ async def create(req: Req):
         raise HTTPException(401, "bad token")
     if not re.match(r"^https?://", req.url):
         raise HTTPException(400, "invalid url")
+    
+    # Retain up to 30 recent jobs in history
     for k in list(JOBS)[:-30]:
         JOBS.pop(k, None)
+        
     jid = uuid.uuid4().hex[:10]
-    JOBS[jid] = {"status": "queued", "bytes": 0, "log": "Queued for processing...", "t": time.time()}
+    JOBS[jid] = {
+        "source_url": req.url,
+        "status": "queued",
+        "bytes": 0,
+        "log": "Queued for processing...",
+        "t": time.time(),
+        "cancelled": False
+    }
     await JOB_QUEUE.put(jid)
     return {"id": jid}
 
 
+@app.post("/api/jobs/{jid}/cancel")
+def cancel_job(jid: str):
+    if jid not in JOBS:
+        raise HTTPException(404, "Job not found")
+    job = JOBS[jid]
+    if job["status"] in ("done", "error", "cancelled"):
+        return {"status": job["status"], "message": "Job already finished"}
+    job["cancelled"] = True
+    job["status"] = "cancelled"
+    job["log"] = "Job cancelled by user."
+    return {"status": "cancelled"}
+
+
 @app.get("/api/jobs/{jid}")
-def status(jid: str):
+def get_job(jid: str):
     if jid not in JOBS:
         raise HTTPException(404)
     return JOBS[jid]
@@ -292,21 +353,128 @@ def status(jid: str):
 def home():
     return """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
 <title>yt → litterbox</title>
-<style>body{font:16px system-ui;max-width:520px;margin:2rem auto;padding:0 1rem}
-input,button{width:100%;padding:.8rem;margin:.3rem 0;font-size:1rem;box-sizing:border-box}
-pre{white-space:pre-wrap;word-break:break-all}</style>
+<style>
+  body{font:15px system-ui,-apple-system,sans-serif;max-width:540px;margin:1.5rem auto;padding:0 1rem;background:#f9f9f9;color:#222}
+  input,button{width:100%;padding:.75rem;margin:.3rem 0;font-size:1rem;box-sizing:border-box;border-radius:6px;border:1px solid #ccc}
+  button{background:#0066cc;color:#fff;font-weight:600;border:none;cursor:pointer}
+  button:hover{background:#0052a3}
+  button.cancel{background:#d9534f;color:#fff;padding:.4rem .8rem;font-size:.85rem;width:auto;margin-top:.4rem}
+  button.cancel:hover{background:#c9302c}
+  .card{background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:.8rem 1rem;margin:.8rem 0;box-shadow:0 1px 3px rgba(0,0,0,0.05)}
+  .card.active{border-left:5px solid #0066cc}
+  .card.queued{border-left:5px solid #f0ad4e}
+  .card.done{border-left:5px solid #5cb85c}
+  .card.error,.card.cancelled{border-left:5px solid #d9534f}
+  .badge{display:inline-block;padding:.2rem .5rem;font-size:.75rem;font-weight:bold;border-radius:4px;text-transform:uppercase}
+  .badge-active{background:#e6f2ff;color:#0066cc}
+  .badge-queued{background:#fef5e7;color:#f0ad4e}
+  .badge-done{background:#eafaf1;color:#27ae60}
+  .badge-error{background:#fadbd8;color:#c0392b}
+  .section-title{font-size:1.1rem;margin:1.2rem 0 .4rem 0;color:#444;border-bottom:1px solid #ddd;padding-bottom:.3rem}
+  pre{white-space:pre-wrap;word-break:break-all;font-size:.85rem;background:#f0f0f0;padding:.5rem;border-radius:4px}
+  a{color:#0066cc;text-decoration:none;word-break:break-all}
+  a:hover{text-decoration:underline}
+</style>
+
 <h2>Video → Litterbox (1h Expiry / 1 GB Limit)</h2>
-<input id=u placeholder="Video URL"><input id=t placeholder="Access token (if set)" type=password>
-<button onclick=go()>Upload</button><pre id=o></pre>
+<div class="card">
+  <input id="u" placeholder="Video URL">
+  <input id="t" placeholder="Access token (if set)" type="password">
+  <button onclick="submitJob()">Upload to Queue</button>
+</div>
+
+<div id="queueContainer"></div>
+
 <script>
-async function go(){const o=document.getElementById('o');o.textContent='Starting…';
-const r=await fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},
-body:JSON.stringify({url:u.value,token:t.value})});
-if(!r.ok){o.textContent='Error '+r.status;return}
-const {id}=await r.json();
-const i=setInterval(async()=>{const j=await (await fetch('/api/jobs/'+id)).json();
-const sizeStr = j.total_size ? ((j.bytes/1e6).toFixed(1) + '/' + (j.total_size/1e6).toFixed(1) + ' MB') : ((j.bytes/1e6).toFixed(1) + ' MB');
-o.textContent='Status: '+j.status+(j.quality?'\\nQuality: '+j.quality:'')+'\\nSize: '+sizeStr
-+(j.log?'\\nLog: '+j.log:'')+(j.note?'\\nNote: '+j.note:'')+(j.error?'\\nError: '+j.error:'')+(j.url?'\\n\\nURL: '+j.url:'');
-if(j.status=='done'||j.status=='error')clearInterval(i)},1500)}
+function escapeHtml(str) {
+  return (str || '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+async function submitJob() {
+  const u = document.getElementById('u');
+  const t = document.getElementById('t');
+  if(!u.value.trim()) return;
+  
+  const r = await fetch('/api/jobs', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({url: u.value.trim(), token: t.value.trim()})
+  });
+  
+  if(r.ok) {
+    u.value = '';
+    fetchQueue();
+  } else {
+    alert('Failed to submit job: HTTP ' + r.status);
+  }
+}
+
+async function cancelJob(jid) {
+  await fetch('/api/jobs/' + jid + '/cancel', {method: 'POST'});
+  fetchQueue();
+}
+
+async function fetchQueue() {
+  try {
+    const res = await fetch('/api/jobs');
+    if(!res.ok) return;
+    const jobs = await res.json();
+    
+    const active = jobs.filter(j => !['queued', 'done', 'error', 'cancelled'].includes(j.status));
+    const queued = jobs.filter(j => j.status === 'queued');
+    const finished = jobs.filter(j => ['done', 'error', 'cancelled'].includes(j.status));
+    
+    let html = '';
+    
+    if(active.length > 0) {
+      html += '<div class="section-title">Currently Processing</div>';
+      active.forEach(j => {
+        const sizeStr = j.total_size ? ((j.bytes/1e6).toFixed(1) + '/' + (j.total_size/1e6).toFixed(1) + ' MB') : ((j.bytes/1e6).toFixed(1) + ' MB');
+        html += `<div class="card active">
+          <div><span class="badge badge-active">${escapeHtml(j.status)}</span></div>
+          <div style="margin-top:.4rem"><b>${escapeHtml(j.title || j.source_url)}</b></div>
+          ${j.quality ? '<div>Quality: ' + escapeHtml(j.quality) + '</div>' : ''}
+          <div>Size: ${sizeStr}</div>
+          ${j.log ? '<div style="color:#666;font-size:.85rem;margin-top:.3rem">' + escapeHtml(j.log) + '</div>' : ''}
+          <button class="cancel" onclick="cancelJob('${j.id}')">Cancel Job</button>
+        </div>`;
+      });
+    }
+    
+    if(queued.length > 0) {
+      html += '<div class="section-title">Pending Queue (' + queued.length + ')</div>';
+      queued.forEach((j, idx) => {
+        html += `<div class="card queued">
+          <div><span class="badge badge-queued">Queue Position #${idx + 1}</span></div>
+          <div style="margin-top:.4rem;word-break:break-all"><b>${escapeHtml(j.source_url)}</b></div>
+          <button class="cancel" onclick="cancelJob('${j.id}')">Remove from Queue</button>
+        </div>`;
+      });
+    }
+    
+    if(finished.length > 0) {
+      html += '<div class="section-title">Recent Activity</div>';
+      finished.slice(0, 8).forEach(j => {
+        const bClass = j.status === 'done' ? 'badge-done' : 'badge-error';
+        html += `<div class="card ${j.status}">
+          <div><span class="badge ${bClass}">${escapeHtml(j.status)}</span></div>
+          <div style="margin-top:.3rem"><b>${escapeHtml(j.title || j.source_url)}</b></div>
+          ${j.result_url ? '<div style="margin-top:.4rem"><a href="' + escapeHtml(j.result_url) + '" target="_blank">' + escapeHtml(j.result_url) + '</a></div>' : ''}
+          ${j.error ? '<div style="color:#c0392b;font-size:.85rem;margin-top:.3rem">' + escapeHtml(j.error) + '</div>' : ''}
+        </div>`;
+      });
+    }
+    
+    if(jobs.length === 0) {
+      html = '<div style="text-align:center;color:#888;margin:2rem 0">No active or queued jobs.</div>';
+    }
+    
+    document.getElementById('queueContainer').innerHTML = html;
+  } catch(e) {}
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  fetchQueue();
+  setInterval(fetchQueue, 1500);
+});
 </script>"""
