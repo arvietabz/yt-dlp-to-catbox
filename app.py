@@ -1,5 +1,5 @@
-"""yt-dlp -> ffmpeg -> curl (Litterbox 1GB / 1h expiry).
-FastAPI Server with Async Queue, Native cURL Uploads, Global State & UI Queue Dashboard.
+"""yt-dlp -> ffmpeg -> native Python HTTP upload (Litterbox 1GB / 1h expiry).
+FastAPI Server with Async Queue, Native HTTP Uploads, Global State & UI Queue Dashboard.
 """
 import asyncio
 import os
@@ -7,6 +7,7 @@ import re
 import subprocess
 import time
 import uuid
+import requests
 import yt_dlp
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -156,7 +157,6 @@ def process_job_sync(jid, source_url):
     job = JOBS[jid]
     out_path = f"/tmp/{jid}.mp4"
     proc = None
-    curl_proc = None
     try:
         if job.get("cancelled"):
             raise RuntimeError("Job cancelled by user.")
@@ -226,44 +226,36 @@ def process_job_sync(jid, source_url):
 
         final_size = os.path.getsize(out_path)
         job.update(status="uploading to litterbox (1h expiry)", total_size=final_size, bytes=final_size)
-        job["log"] = f"File processed ({final_size / 1e6:.1f} MB). Dispatching cURL upload..."
+        job["log"] = f"File processed ({final_size / 1e6:.1f} MB). Dispatching HTTP upload..."
 
         clean_title = re.sub(r"[^A-Za-z0-9_\- ]", "", info.get("title") or "")[:60].strip() or "video"
-        upload_cmd = [
-            "curl", "-s", "-S",
-            "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "-F", "reqtype=fileupload",
-            "-F", "time=1h",
-            "-F", f"fileToUpload=@{out_path};filename={clean_title}.mp4",
-            LITTERBOX_URL
-        ]
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        data = {
+            "reqtype": "fileupload",
+            "time": "1h"
+        }
 
-        curl_proc = subprocess.Popen(upload_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        while curl_proc.poll() is None:
-            time.sleep(0.5)
-            if job.get("cancelled"):
-                curl_proc.kill()
-                raise RuntimeError("Job cancelled by user.")
-
-        out_url, curl_err = curl_proc.communicate()
-
-        if curl_proc.returncode != 0:
-            raise RuntimeError(f"cURL upload failed (code {curl_proc.returncode}): {curl_err}")
-
-        out_url = out_url.strip()
-        if not out_url.startswith("http"):
-            raise RuntimeError(f"Litterbox response error: '{out_url[:200]}'")
+        with open(out_path, "rb") as f:
+            files = {
+                "fileToUpload": (f"{clean_title}.mp4", f, "video/mp4")
+            }
+            r = requests.post(LITTERBOX_URL, data=data, files=files, headers=headers, timeout=(30, 1200))
 
         if job.get("cancelled"):
             raise RuntimeError("Job cancelled by user.")
+
+        out_url = r.text.strip()
+        if not out_url.startswith("http"):
+            raise RuntimeError(f"Litterbox response error [HTTP {r.status_code}]: '{out_url[:200]}'")
 
         job.update(status="done", result_url=out_url, log="Upload completed successfully!")
 
     except Exception as e:
         if proc and proc.poll() is None:
             proc.kill()
-        if curl_proc and curl_proc.poll() is None:
-            curl_proc.kill()
 
         if job.get("cancelled"):
             job.update(status="cancelled", log="Job cancelled by user.", error="")
