@@ -213,6 +213,16 @@ def get_dashboard_html() -> str:
         <input type="checkbox" id="forceGeneric">
         Force Generic Extractor (--force-generic-extractor)
       </label>
+
+      <!-- Custom Cookies Controls -->
+      <label class="checkbox-label">
+        <input type="checkbox" id="useCookies" onchange="handleCookiesCheckboxChange()">
+        🍪 Use Custom cookies.txt
+        <span id="cookiesStatus" style="color:#27ae60;font-weight:600;display:none;margin-left:4px">(cookies.txt imported)</span>
+      </label>
+      <div id="cookiesUploadWrapper" style="display:none;margin:.4rem 0 .4rem 24px;">
+        <input type="file" id="cookiesFileInput" accept=".txt" onchange="handleCookieFileUpload(event)" style="font-size:.85rem;padding:.4rem;">
+      </div>
     </div>
   </details>
 
@@ -249,6 +259,54 @@ function updateInputActionIcon() {{
     btn.innerHTML = pasteIcon;
     btn.title = 'Paste from Clipboard';
   }}
+}}
+
+function updateCookiesUI() {{
+  const useCookies = document.getElementById('useCookies');
+  const cookiesStatus = document.getElementById('cookiesStatus');
+  const cookiesUploadWrapper = document.getElementById('cookiesUploadWrapper');
+  const savedCookies = localStorage.getItem('custom_cookies');
+
+  if (useCookies.checked) {{
+    if (savedCookies) {{
+      cookiesStatus.style.display = 'inline';
+      cookiesUploadWrapper.style.display = 'none';
+    }} else {{
+      cookiesStatus.style.display = 'none';
+      cookiesUploadWrapper.style.display = 'block';
+    }}
+  }} else {{
+    cookiesStatus.style.display = 'none';
+    cookiesUploadWrapper.style.display = 'none';
+  }}
+}}
+
+function handleCookiesCheckboxChange() {{
+  const useCookies = document.getElementById('useCookies');
+  if (useCookies.checked) {{
+    localStorage.setItem('use_cookies', 'true');
+  }} else {{
+    localStorage.removeItem('use_cookies');
+    localStorage.removeItem('custom_cookies');
+    const input = document.getElementById('cookiesFileInput');
+    if (input) input.value = '';
+  }}
+  updateCookiesUI();
+}}
+
+function handleCookieFileUpload(e) {{
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(evt) {{
+    const text = evt.target.result;
+    if (text) {{
+      localStorage.setItem('custom_cookies', text);
+      localStorage.setItem('use_cookies', 'true');
+      updateCookiesUI();
+    }}
+  }};
+  reader.readAsText(file);
 }}
 
 async function triggerUpdate() {{
@@ -313,6 +371,17 @@ window.addEventListener('DOMContentLoaded', () => {{
   urlInput.addEventListener('input', updateInputActionIcon);
   updateInputActionIcon();
 
+  const useCookies = document.getElementById('useCookies');
+  const isCookiesEnabled = localStorage.getItem('use_cookies') === 'true';
+  if (isCookiesEnabled && localStorage.getItem('custom_cookies')) {{
+    useCookies.checked = true;
+  }} else {{
+    useCookies.checked = false;
+    localStorage.removeItem('use_cookies');
+    localStorage.removeItem('custom_cookies');
+  }}
+  updateCookiesUI();
+
   fetchQueue();
   fetchVersion();
   setInterval(fetchQueue, 1500);
@@ -328,12 +397,15 @@ async function submitJob() {{
   const directMode = document.getElementById('directMode');
   const forceGeneric = document.getElementById('forceGeneric');
   const useProxy = document.getElementById('useProxy');
+  const useCookies = document.getElementById('useCookies');
 
   if(!u.value.trim()) return;
   
   if(t.value.trim()) {{
     localStorage.setItem('access_token', t.value.trim());
   }}
+
+  const cookiesText = (useCookies && useCookies.checked) ? (localStorage.getItem('custom_cookies') || '') : '';
 
   const payload = {{
     url: u.value.trim(),
@@ -343,7 +415,8 @@ async function submitJob() {{
     custom_title: ctitle.value.trim(),
     direct_mode: directMode.checked,
     force_generic: forceGeneric.checked,
-    use_proxy: useProxy.checked
+    use_proxy: useProxy.checked,
+    cookies: cookiesText
   }};
 
   const r = await fetch('/api/jobs', {{
