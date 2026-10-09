@@ -43,12 +43,16 @@ def process_job_sync(jid, source_url):
                 "no_warnings": True,
                 "noplaylist": True,
                 "skip_download": True,
-                "extractor_args": {
+            }
+
+            # If no custom cookies are provided, use fallback mobile clients
+            if not job.get("cookies"):
+                opts["extractor_args"] = {
                     "youtube": {
                         "player_client": ["android", "ios"]
                     }
                 }
-            }
+
             if custom_headers:
                 opts["http_headers"] = custom_headers
             if job_proxy:
