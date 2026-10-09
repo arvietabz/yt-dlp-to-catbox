@@ -1,4 +1,4 @@
-"""yt-dlp -> ffmpeg (pipe) -> catbox.moe. Nothing is written to disk except temp stream file."""
+"""yt-dlp -> ffmpeg (pipe) -> catbox.moe. Detailed error logging version."""
 import os
 import re
 import subprocess
@@ -12,13 +12,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-MAX_BYTES = int(float(os.getenv("MAX_MB", "190")) * 1_000_000)   # target ceiling
-HARD_BYTES = 199_000_000                                          # abort above this
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "")
+MAX_BYTES = int(float(os.getenv("MAX_MB", "190")) * 1_000_000)
+HARD_BYTES = 199_000_000
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "").strip()
 USERHASH = os.getenv("CATBOX_USERHASH", "").strip()
 CATBOX = "https://catbox.moe/user/api.php"
-PROXY = os.getenv("PROXY", "")
-YT_COOKIES = os.getenv("YT_COOKIES", "")
+PROXY = os.getenv("PROXY", "").strip()
+YT_COOKIES = os.getenv("YT_COOKIES", "").strip()
 COOKIE_PATH = "/tmp/cookies.txt"
 
 if YT_COOKIES:
@@ -206,24 +206,39 @@ def run_job(jid, url):
                     tmp.write(c)
 
                 if proc.wait() != 0:
-                    raise RuntimeError("ffmpeg failed: " + proc.stderr.read().decode()[-300:])
+                    err_msg = proc.stderr.read().decode()[-300:]
+                    raise RuntimeError(f"ffmpeg failed (exit code {proc.returncode}): {err_msg}")
 
+                tmp.seek(0, os.SEEK_END)
+                actual_file_size = tmp.tell()
                 tmp.seek(0)
+
+                if actual_file_size == 0:
+                    raise RuntimeError("ffmpeg produced a 0-byte video file; upload cancelled.")
+
                 job["status"] = "uploading"
 
                 data = {"reqtype": "fileupload"}
-                if USERHASH:
+                has_userhash = bool(USERHASH and re.match(r"^[a-f0-9]+$", USERHASH, re.IGNORECASE))
+                if has_userhash:
                     data["userhash"] = USERHASH
 
                 files = {
                     "fileToUpload": (f"{name}.mp4", tmp, "video/mp4")
                 }
 
-                r = requests.post(CATBOX, data=data, files=files, timeout=900)
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                }
+
+                r = requests.post(CATBOX, data=data, files=files, headers=headers, timeout=900)
 
             out = r.text.strip()
             if not out.startswith("http"):
-                raise RuntimeError(f"Catbox said: {out[:200]}")
+                diag = (f"Catbox Error [HTTP {r.status_code}]: '{out[:200]}'\n"
+                        f"Debug: size={actual_file_size}B, userhash_sent={has_userhash}")
+                raise RuntimeError(diag)
+
             job.update(status="done", url=out)
 
         except Exception as e:
