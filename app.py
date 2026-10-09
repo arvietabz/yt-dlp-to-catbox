@@ -1,6 +1,6 @@
 """
 yt-dlp -> ffmpeg -> native Python HTTP upload (Litterbox 1GB / 1h expiry).
-FastAPI Server with Async Queue, Interactive Proxy Control, & Mobile UI Dashboard.
+FastAPI Server with Tailscale Integration & Mobile UI Dashboard.
 File: app.py
 """
 import asyncio
@@ -178,7 +178,6 @@ def process_job_sync(jid, source_url):
         enc = None
         info = {}
 
-        # DIRECT MODE: Skip yt-dlp entirely and stream URL straight into FFmpeg
         if job.get("direct_mode"):
             job["status"] = "direct streaming"
             job["log"] = "Bypassing yt-dlp, passing stream directly to FFmpeg..."
@@ -320,6 +319,27 @@ async def queue_worker():
 
 @app.on_event("startup")
 async def startup_event():
+    # Initialize Tailscale user-space daemon for direct WireGuard connection to phone
+    ts_authkey = os.getenv("TAILSCALE_AUTHKEY", "").strip()
+    if ts_authkey:
+        print("Starting Tailscale user-space daemon...")
+        try:
+            subprocess.Popen([
+                "tailscaled", 
+                "--tun=userspace-networking", 
+                "--socks5-server=localhost:1055"
+            ])
+            await asyncio.sleep(2)
+            subprocess.Popen([
+                "tailscale", 
+                "up", 
+                f"--authkey={ts_authkey}", 
+                "--hostname=render-fastapi"
+            ])
+            print("Tailscale node registered successfully!")
+        except Exception as e:
+            print(f"Tailscale startup failed: {e}")
+
     asyncio.create_task(queue_worker())
 
 
@@ -597,7 +617,7 @@ def home():
   
   <label class="checkbox-label" style="font-weight: 600; margin-top: .6rem;">
     <input type="checkbox" id="useProxy">
-    🌐 Use Mobile Residential Proxy (Every Proxy / Ngrok)
+    🌐 Use Mobile Residential Proxy (Tailscale)
   </label>
 
   <details>
