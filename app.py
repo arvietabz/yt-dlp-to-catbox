@@ -1,6 +1,13 @@
 """yt-dlp -> ffmpeg (pipe) -> catbox.moe. Nothing is written to disk."""
-import io, os, re, subprocess, threading, time, uuid
-import requests, yt_dlp
+import io
+import os
+import re
+import subprocess
+import threading
+import time
+import uuid
+import requests
+import yt_dlp
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -9,13 +16,14 @@ MAX_BYTES = int(float(os.getenv("MAX_MB", "190")) * 1_000_000)   # target ceilin
 HARD_BYTES = 199_000_000                                          # abort above this
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "")
 USERHASH = os.getenv("CATBOX_USERHASH", "")
-BUFFER_IN_RAM = os.getenv("BUFFER_IN_RAM", "0") == "1"  # fallback if catbox rejects chunked upload
+BUFFER_IN_RAM = os.getenv("BUFFER_IN_RAM", "0") == "1"
 CATBOX = "https://catbox.moe/user/api.php"
-PROXY = os.getenv("PROXY", "")          # e.g. http://user:pass@host:port
-YT_COOKIES = os.getenv("YT_COOKIES", "")  # full contents of a Netscape cookies.txt
+PROXY = os.getenv("PROXY", "")
+YT_COOKIES = os.getenv("YT_COOKIES", "")
 COOKIE_PATH = "/tmp/cookies.txt"
+
 if YT_COOKIES:
-    with open(COOKIE_PATH, "w") as _f:  # tiny file, not video data
+    with open(COOKIE_PATH, "w") as _f:
         _f.write(YT_COOKIES)
 
 app = FastAPI()
@@ -24,88 +32,104 @@ SEM = threading.Semaphore(int(os.getenv("MAX_CONCURRENT", "1")))
 
 
 def est_size(f, dur):
+    """Calculate file size in bytes or fallback to estimated bitrate math."""
     s = f.get("filesize") or f.get("filesize_approx")
     if s:
         return s
-    br = f.get("tbr") or ((f.get("vbr") or 0) + (f.get("abr") or 0)) or None
-    if br and dur and dur > 0:
-        return br * 1000 / 8 * dur
-    return None
+    br = f.get("tbr") or ((f.get("vbr") or 0) + (f.get("abr") or 0))
+    if br:
+        d = dur if (dur and dur > 0) else 180  # Default to 3 mins if duration is missing/0
+        return int(br * 1000 / 8 * d)
+    return 0
 
 
 def pick(info):
-    """Best (video+audio) or progressive combo whose total size fits MAX_BYTES."""
+    """Select the best progressive or separate video+audio streams fitting MAX_BYTES."""
     dur = info.get("duration") or 0
-    fmts = [f for f in info.get("formats", []) if f.get("url") and f.get("protocol") not in ("mhtml",)]
+    fmts = [f for f in info.get("formats", []) if f.get("url") and f.get("protocol") != "mhtml"]
+    
     vid = [f for f in fmts if f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")]
     aud = [f for f in fmts if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
     prog = [f for f in fmts if f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")]
+    
     aud.sort(key=lambda f: f.get("abr") or f.get("tbr") or 0, reverse=True)
 
-    cands = []  # (score, [formats], size)
+    cands = []  # (height, bitrate, [formats], calculated_size)
+
+    # 1. Progressive streams
     for p in prog:
         s = est_size(p, dur)
-        if s and s <= MAX_BYTES:
-            cands.append(((p.get("height") or 0, p.get("tbr") or 0), [p], s))
+        if 0 < s <= MAX_BYTES:
+            cands.append((p.get("height") or 0, p.get("tbr") or 0, [p], s))
+
+    # 2. Separate Video + Audio streams
     for v in vid:
         vs = est_size(v, dur)
-        if not vs:
-            continue
-        for a in aud:  # best audio that still fits
+        for a in aud:
             as_ = est_size(a, dur)
-            if as_ and vs + as_ <= MAX_BYTES:
-                cands.append(((v.get("height") or 0, v.get("tbr") or 0), [v, a], vs + as_))
-                break
+            tot = vs + as_
+            if 0 < tot <= MAX_BYTES:
+                cands.append((v.get("height") or 0, v.get("tbr") or 0, [v, a], tot))
+                break  # Best audio that fits with this video format
 
-    if not cands:
-        # Fallback for unknown sizes or missing/0 duration: select 720p or lower and rely on HARD_BYTES guard
-        unk = [p for p in prog if (p.get("height") or 0) <= 720]
-        if unk:
-            unk.sort(key=lambda f: f.get("height") or 0, reverse=True)
-            return ((0, 0), [unk[0]], MAX_BYTES)
-        unk_v = [v for v in vid if (v.get("height") or 0) <= 720]
-        if unk_v and aud:
-            unk_v.sort(key=lambda f: f.get("height") or 0, reverse=True)
-            return ((0, 0), [unk_v[0], aud[-1]], MAX_BYTES)
-        return None
+    if cands:
+        cands.sort(key=lambda c: (c[0], c[1]), reverse=True)
+        best = cands[0]
+        return (best[0], best[1]), best[2], best[3]
 
-    cands.sort(key=lambda c: c[0], reverse=True)
-    return cands[0]
+    # 3. Fallback when size is completely unknown (or dur == 0): Grab lowest available <= 720p stream
+    low_prog = [p for p in prog if (p.get("height") or 0) <= 720]
+    if low_prog:
+        low_prog.sort(key=lambda f: f.get("height") or 0)
+        return ((0, 0), [low_prog[0]], MAX_BYTES)
+
+    low_vid = [v for v in vid if (v.get("height") or 0) <= 720]
+    if low_vid:
+        low_vid.sort(key=lambda f: f.get("height") or 0)
+        chosen = [low_vid[0]]
+        if aud:
+            chosen.append(aud[-1])  # Lowest bitrate audio
+        return ((0, 0), chosen, MAX_BYTES)
+
+    return None
 
 
 def plan_transcode(info):
-    """Pick a source + bitrate so the re-encoded output lands under MAX_BYTES."""
+    """Determine bitrate and target height for re-encoding if direct copying won't fit."""
     dur = info.get("duration")
-    # If duration is missing or 0, estimate based on a conservative 3-minute window
     if not dur or dur <= 0:
-        dur = 180
+        dur = 180  # Assume 3 minutes if duration is missing
 
     abr = 96
-    total_kbps = MAX_BYTES * 0.92 * 8 / dur / 1000      # 8% safety margin
+    total_kbps = MAX_BYTES * 0.92 * 8 / dur / 1000  # 8% safety buffer
     vbr = int(total_kbps - abr)
+    
+    target_h = 240
     for h in (1080, 720, 480, 360, 240):
         need = {1080: 2500, 720: 1200, 480: 600, 360: 300, 240: 150}[h]
         if vbr >= need:
             target_h = h
             break
     else:
-        target_h = 240
         vbr = 150
 
     fmts = [f for f in info.get("formats", []) if f.get("url") and f.get("protocol") != "mhtml"]
     vid = [f for f in fmts if f.get("vcodec") not in (None, "none")]
     if not vid:
         return None
+
     ok = [f for f in vid if (f.get("height") or 0) <= target_h] or vid
     ok.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
     src = ok[0]
     chosen = [src]
+
     if src.get("acodec") in (None, "none"):
         aud = [f for f in fmts if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
         if not aud:
             return None
         aud.sort(key=lambda f: f.get("abr") or 0, reverse=True)
         chosen.append(aud[0])
+
     scale = target_h if (src.get("height") or 0) > target_h else None
     return chosen, {"vbr": vbr, "abr": abr, "scale": scale}, MAX_BYTES, target_h
 
@@ -114,14 +138,16 @@ def build_cmd(chosen, enc=None):
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
     for f in chosen:
         hdr = "".join(f"{k}: {v}\r\n" for k, v in (f.get("http_headers") or {}).items())
-        if PROXY:  # stream URLs are IP-locked, so ffmpeg must use the same proxy
+        if PROXY:
             cmd += ["-http_proxy", PROXY]
         cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                 "-headers", hdr, "-i", f["url"]]
+
     if len(chosen) == 2:
         cmd += ["-map", "0:v:0", "-map", "1:a:0"]
-    acodec = (chosen[-1].get("acodec") or "")
-    if enc:  # re-encode to hit the size target
+
+    acodec = chosen[-1].get("acodec") or ""
+    if enc:
         v = enc["vbr"]
         if enc["scale"]:
             cmd += ["-vf", f"scale=-2:{enc['scale']}"]
@@ -130,6 +156,7 @@ def build_cmd(chosen, enc=None):
                 "-bufsize", f"{v * 2}k", "-c:a", "aac", "-b:a", f"{enc['abr']}k"]
     else:
         cmd += ["-c:v", "copy", "-c:a", "copy" if acodec.startswith("mp4a") else "aac"]
+
     cmd += ["-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"]
     return cmd
 
@@ -145,28 +172,30 @@ def run_job(jid, url):
                 opts["proxy"] = PROXY
             if YT_COOKIES:
                 opts["cookiefile"] = COOKIE_PATH
+
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
+
             choice = pick(info)
             enc = None
+
             if not choice and os.getenv("ALLOW_TRANSCODE", "1") == "1":
                 plan = plan_transcode(info)
                 if plan:
                     chosen, enc, size, th = plan
                     choice = ((0, 0), chosen, size)
                     job["note"] = f"re-encoding to {min(th, chosen[0].get('height') or th)}p to fit"
+
             if not choice:
                 d = info.get("duration") or 0
-                sizes = [est_size(f, d) for f in info.get("formats", []) if f.get("vcodec") not in (None, "none")]
-                sizes = [x for x in sizes if x]
-                hint = f" Smallest video format is ~{int(min(sizes) / 1e6)} MB." if sizes else " Format sizes unavailable."
-                raise RuntimeError(f"No format fits under {MAX_BYTES // 1_000_000} MB "
-                                   f"(duration {int(d // 60)} min).{hint}")
+                raise RuntimeError(f"No usable format found for this URL (duration {int(d // 60)} min).")
+
             _, chosen, size = choice
             vf = chosen[0]
             job.update(status="streaming",
-                       quality=f"{vf.get('height')}p ~{int(size / 1e6)} MB",
+                       quality=f"{vf.get('height') or 'unknown'}p ~{int(size / 1e6)} MB",
                        title=info.get("title"))
+
             name = re.sub(r"[^A-Za-z0-9_\- ]", "", info.get("title") or "")[:80].strip() or "video"
             boundary = uuid.uuid4().hex
             pre = (f'--{boundary}\r\nContent-Disposition: form-data; name="reqtype"\r\n\r\nfileupload\r\n'
@@ -192,7 +221,7 @@ def run_job(jid, url):
                         raise RuntimeError("Output exceeded the 200 MB limit; aborted.")
                     yield c
 
-            if BUFFER_IN_RAM:  # exact Content-Length, uses RAM instead of disk
+            if BUFFER_IN_RAM:
                 buf = io.BytesIO()
                 buf.write(pre)
                 for c in chunks():
@@ -203,7 +232,7 @@ def run_job(jid, url):
                 buf.seek(0)
                 job["status"] = "uploading"
                 r = requests.post(CATBOX, data=buf, headers=headers, timeout=900)
-            else:  # true streaming, chunked transfer encoding
+            else:
                 def body():
                     yield pre
                     yield from chunks()
@@ -216,6 +245,7 @@ def run_job(jid, url):
             if not out.startswith("http"):
                 raise RuntimeError(f"Catbox said: {out[:200]}")
             job.update(status="done", url=out)
+
         except Exception as e:
             if proc and proc.poll() is None:
                 proc.kill()
@@ -233,7 +263,7 @@ def create(req: Req):
         raise HTTPException(401, "bad token")
     if not re.match(r"^https?://", req.url):
         raise HTTPException(400, "invalid url")
-    for k in list(JOBS)[:-30]:  # keep memory small
+    for k in list(JOBS)[:-30]:
         JOBS.pop(k, None)
     jid = uuid.uuid4().hex[:10]
     JOBS[jid] = {"status": "queued", "bytes": 0, "t": time.time()}
