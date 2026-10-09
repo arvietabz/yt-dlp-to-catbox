@@ -244,7 +244,11 @@ def run_job(jid, url):
                     "fileToUpload": (f"{name}.mp4", wrapped_file, "video/mp4")
                 }
 
-                r = requests.post(LITTERBOX, data=data, files=files, timeout=(30, 1200))
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                }
+
+                r = requests.post(LITTERBOX, data=data, files=files, headers=headers, timeout=(30, 1200))
 
             out = r.text.strip()
             if not out.startswith("http"):
