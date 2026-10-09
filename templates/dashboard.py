@@ -177,7 +177,7 @@ def get_dashboard_html() -> str:
     text-align: center;
     font-size: 0.78rem;
     color: #888;
-    margin: 1rem 0 0.2rem 0;
+    margin: 0.8rem 0;
     user-select: none;
   }}
   
@@ -220,9 +220,10 @@ def get_dashboard_html() -> str:
   <button onclick="submitJob()">Upload to Queue</button>
 </div>
 
-<div id="queueContainer"></div>
-
+<!-- Positioned above Currently Processing and below Upload to Queue -->
 <div class="ytdlp-tag" id="ytdlpTag">yt-dlp v{state.CURRENT_YTDLP_VERSION}</div>
+
+<div id="queueContainer"></div>
 
 <div id="activityContainer"></div>
 
@@ -480,7 +481,7 @@ async function fetchQueue() {{
         queueHtml += `<div class="swipe-container">
           <div class="swipe-action-bg">
             <button class="swipe-action-btn" onclick="deleteCard('${{j.id}}')">
-              <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6"/></svg>
+              <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012 2v2M10 11v6M14 11v6"/></svg>
             </button>
           </div>
           <div class="card queued" id="card-el-${{j.id}}" style="${{transformStyle}}" ontouchstart="handleTouchStart(event, '${{j.id}}')" ontouchmove="handleTouchMove(event, '${{j.id}}')" ontouchend="handleTouchEnd(event, '${{j.id}}')">
