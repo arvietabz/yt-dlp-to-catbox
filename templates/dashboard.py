@@ -220,7 +220,6 @@ def get_dashboard_html() -> str:
   <button onclick="submitJob()">Upload to Queue</button>
 </div>
 
-<!-- Version tag positioned strictly below Upload card and above all queue/activity sections -->
 <div class="ytdlp-tag" id="ytdlpTag">yt-dlp v{state.CURRENT_YTDLP_VERSION}</div>
 
 <div id="queueContainer"></div>
@@ -454,7 +453,8 @@ async function fetchQueue() {{
         const isOpen = openCards.has(j.id);
         const transformStyle = isOpen ? 'transform: translateX(-70px);' : '';
         const sizeStr = j.total_size ? ((j.bytes/1e6).toFixed(1) + '/' + (j.total_size/1e6).toFixed(1) + ' MB') : ((j.bytes/1e6).toFixed(1) + ' MB');
-        
+        const pctBadge = j.download_pct ? `<span class="badge badge-active" style="margin-left:4px">${{j.download_pct}}%</span>` : '';
+
         queueHtml += `<div class="swipe-container">
           <div class="swipe-action-bg">
             <button class="swipe-action-btn" onclick="deleteCard('${{j.id}}')">
@@ -464,6 +464,7 @@ async function fetchQueue() {{
           <div class="card active" id="card-el-${{j.id}}" style="${{transformStyle}}" ontouchstart="handleTouchStart(event, '${{j.id}}')" ontouchmove="handleTouchMove(event, '${{j.id}}')" ontouchend="handleTouchEnd(event, '${{j.id}}')">
             <div>
               <span class="badge badge-active">${{escapeHtml(j.status)}}</span>
+              ${{pctBadge}}
               ${{j.use_proxy ? '<span class="badge badge-queued" style="margin-left:4px">PROXY ON</span>' : ''}}
             </div>
             <div style="margin-top:.4rem"><b>${{escapeHtml(j.title || j.source_url)}}</b></div>
