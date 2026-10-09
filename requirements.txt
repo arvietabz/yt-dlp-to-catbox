@@ -1,4 +1,5 @@
 fastapi
 uvicorn
 requests
+pydantic
 yt-dlp[default,curl-cffi]
