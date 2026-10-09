@@ -15,7 +15,7 @@ from pydantic import BaseModel
 MAX_BYTES = int(float(os.getenv("MAX_MB", "190")) * 1_000_000)   # target ceiling
 HARD_BYTES = 199_000_000                                          # abort above this
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "")
-USERHASH = os.getenv("CATBOX_USERHASH", "")
+USERHASH = os.getenv("CATBOX_USERHASH", "").strip()
 CATBOX = "https://catbox.moe/user/api.php"
 PROXY = os.getenv("PROXY", "")
 YT_COOKIES = os.getenv("YT_COOKIES", "")
@@ -190,7 +190,6 @@ def run_job(jid, url):
 
             name = re.sub(r"[^A-Za-z0-9_\- ]", "", info.get("title") or "")[:80].strip() or "video"
 
-            # Execute ffmpeg to pipe output directly to a temporary file
             proc = subprocess.Popen(build_cmd(chosen, enc), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             sent = 0
 
@@ -212,14 +211,15 @@ def run_job(jid, url):
                 tmp.seek(0)
                 job["status"] = "uploading"
 
-                payload = {
-                    "reqtype": (None, "fileupload"),
+                data = {"reqtype": "fileupload"}
+                if USERHASH:
+                    data["userhash"] = USERHASH
+
+                files = {
                     "fileToUpload": (f"{name}.mp4", tmp, "video/mp4")
                 }
-                if USERHASH:
-                    payload["userhash"] = (None, USERHASH)
 
-                r = requests.post(CATBOX, files=payload, timeout=900)
+                r = requests.post(CATBOX, data=data, files=files, timeout=900)
 
             out = r.text.strip()
             if not out.startswith("http"):
