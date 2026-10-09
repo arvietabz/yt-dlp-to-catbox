@@ -220,7 +220,7 @@ def get_dashboard_html() -> str:
   <button onclick="submitJob()">Upload to Queue</button>
 </div>
 
-<!-- Positioned above Currently Processing and below Upload to Queue -->
+<!-- Version tag positioned strictly below Upload card and above all queue/activity sections -->
 <div class="ytdlp-tag" id="ytdlpTag">yt-dlp v{state.CURRENT_YTDLP_VERSION}</div>
 
 <div id="queueContainer"></div>
@@ -233,6 +233,7 @@ function escapeHtml(str) {{
 }}
 
 const openCards = new Set();
+const copiedJobs = new Set();
 let touchState = {{}};
 
 const pasteIcon = `<svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 012 2v14a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect></svg>`;
@@ -385,11 +386,14 @@ async function clearAllHistory() {{
   fetchQueue();
 }}
 
-function copyToClipboard(text, btn) {{
+function copyToClipboard(text, jid) {{
   navigator.clipboard.writeText(text).then(() => {{
-    const origHTML = btn.innerHTML;
-    btn.innerHTML = '<span style="font-size:11px;color:#27ae60">✓ Copied</span>';
-    setTimeout(() => btn.innerHTML = origHTML, 1500);
+    copiedJobs.add(jid);
+    fetchQueue();
+    setTimeout(() => {{
+      copiedJobs.delete(jid);
+      fetchQueue();
+    }}, 3000);
   }});
 }}
 
@@ -481,7 +485,7 @@ async function fetchQueue() {{
         queueHtml += `<div class="swipe-container">
           <div class="swipe-action-bg">
             <button class="swipe-action-btn" onclick="deleteCard('${{j.id}}')">
-              <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012 2v2M10 11v6M14 11v6"/></svg>
+              <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6"/></svg>
             </button>
           </div>
           <div class="card queued" id="card-el-${{j.id}}" style="${{transformStyle}}" ontouchstart="handleTouchStart(event, '${{j.id}}')" ontouchmove="handleTouchMove(event, '${{j.id}}')" ontouchend="handleTouchEnd(event, '${{j.id}}')">
@@ -505,9 +509,12 @@ async function fetchQueue() {{
         const isOpen = openCards.has(j.id);
         const transformStyle = isOpen ? 'transform: translateX(-70px);' : '';
         const bClass = j.status === 'done' ? 'badge-done' : 'badge-error';
-        const copyBtn = j.result_url ? `<button class="copy-btn" onclick="copyToClipboard('${{escapeHtml(j.result_url)}}', this)" title="Copy Link">
-          <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
-        </button>` : '';
+        const isCopied = copiedJobs.has(j.id);
+        const copyBtnContent = isCopied
+          ? '<span style="font-size:11px;color:#27ae60">✓ Copied</span>'
+          : '<svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>';
+
+        const copyBtn = j.result_url ? `<button class="copy-btn" onclick="copyToClipboard('${{escapeHtml(j.result_url)}}', '${{j.id}}')" title="Copy Link">${{copyBtnContent}}</button>` : '';
 
         activityHtml += `<div class="swipe-container">
           <div class="swipe-action-bg">
