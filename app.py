@@ -1,5 +1,5 @@
 """yt-dlp -> ffmpeg -> native Python HTTP upload (Litterbox 1GB / 1h expiry).
-FastAPI Server with Async Queue, Native HTTP Uploads, Global State & Interactive UI Dashboard.
+FastAPI Server with Async Queue, Persistent Swipe States, & Interactive UI Dashboard.
 """
 import asyncio
 import os
@@ -387,7 +387,7 @@ def home():
     background: transparent !important;
     border: none !important;
     color: white !important;
-    padding: 0 !important;
+    padding: 10px !important;
     margin: 0 !important;
     width: auto !important;
     cursor: pointer;
@@ -403,7 +403,7 @@ def home():
     border-radius:8px;
     padding:.8rem 1rem;
     box-shadow:0 1px 3px rgba(0,0,0,0.05);
-    transition: transform 0.2s ease, margin 0.2s ease;
+    transition: transform 0.15s ease-out;
   }
   .card.active{border-left:5px solid #0066cc}
   .card.queued{border-left:5px solid #f0ad4e}
@@ -486,7 +486,10 @@ function escapeHtml(str) {
   return (str || '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-// LocalStorage Token handling
+// Track open swiped cards across DOM re-renders
+const openCards = new Set();
+let touchState = {};
+
 window.addEventListener('DOMContentLoaded', () => {
   const tokenInput = document.getElementById('t');
   const savedToken = localStorage.getItem('access_token');
@@ -525,16 +528,19 @@ async function submitJob() {
 
 async function cancelJob(jid) {
   await fetch('/api/jobs/' + jid + '/cancel', {method: 'POST'});
+  openCards.delete(jid);
   fetchQueue();
 }
 
 async function deleteCard(jid) {
+  openCards.delete(jid);
   await fetch('/api/jobs/' + jid, {method: 'DELETE'});
   fetchQueue();
 }
 
 async function clearAllHistory() {
   await fetch('/api/jobs/clear-history', {method: 'POST'});
+  openCards.clear();
   fetchQueue();
 }
 
@@ -546,32 +552,39 @@ function copyToClipboard(text, btn) {
   });
 }
 
-// Touch / Swipe handling
-let touchState = {};
-
 function handleTouchStart(e, jid) {
-  touchState[jid] = { startX: e.touches[0].clientX, currentX: 0 };
+  const isAlreadyOpen = openCards.has(jid);
+  touchState[jid] = { 
+    startX: e.touches[0].clientX, 
+    currentX: isAlreadyOpen ? -70 : 0,
+    isAlreadyOpen 
+  };
 }
 
 function handleTouchMove(e, jid) {
   if (!touchState[jid]) return;
-  const diffX = e.touches[0].clientX - touchState[jid].startX;
-  if (diffX < 0 && diffX > -120) {
-    touchState[jid].currentX = diffX;
-    const cardEl = document.getElementById('card-el-' + jid);
-    if (cardEl) cardEl.style.transform = `translateX(${diffX}px)`;
-  }
+  const deltaX = e.touches[0].clientX - touchState[jid].startX;
+  let newX = (touchState[jid].isAlreadyOpen ? -70 : 0) + deltaX;
+  if (newX > 0) newX = 0;
+  if (newX < -110) newX = -110;
+  
+  touchState[jid].currentX = newX;
+  const cardEl = document.getElementById('card-el-' + jid);
+  if (cardEl) cardEl.style.transform = `translateX(${newX}px)`;
 }
 
 function handleTouchEnd(e, jid) {
   if (!touchState[jid]) return;
-  const diffX = touchState[jid].currentX;
+  const finalX = touchState[jid].currentX;
   const cardEl = document.getElementById('card-el-' + jid);
+  
   if (cardEl) {
-    if (diffX < -50) {
+    if (finalX < -35) {
       cardEl.style.transform = 'translateX(-70px)';
+      openCards.add(jid);
     } else {
       cardEl.style.transform = 'translateX(0px)';
+      openCards.delete(jid);
     }
   }
   delete touchState[jid];
@@ -592,14 +605,17 @@ async function fetchQueue() {
     if(active.length > 0) {
       html += '<div class="section-header"><div class="section-title">Currently Processing</div></div>';
       active.forEach(j => {
+        const isOpen = openCards.has(j.id);
+        const transformStyle = isOpen ? 'transform: translateX(-70px);' : '';
         const sizeStr = j.total_size ? ((j.bytes/1e6).toFixed(1) + '/' + (j.total_size/1e6).toFixed(1) + ' MB') : ((j.bytes/1e6).toFixed(1) + ' MB');
+        
         html += `<div class="swipe-container">
           <div class="swipe-action-bg">
             <button class="swipe-action-btn" onclick="deleteCard('${j.id}')">
               <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6"/></svg>
             </button>
           </div>
-          <div class="card active" id="card-el-${j.id}" ontouchstart="handleTouchStart(event, '${j.id}')" ontouchmove="handleTouchMove(event, '${j.id}')" ontouchend="handleTouchEnd(event, '${j.id}')">
+          <div class="card active" id="card-el-${j.id}" style="${transformStyle}" ontouchstart="handleTouchStart(event, '${j.id}')" ontouchmove="handleTouchMove(event, '${j.id}')" ontouchend="handleTouchEnd(event, '${j.id}')">
             <div><span class="badge badge-active">${escapeHtml(j.status)}</span></div>
             <div style="margin-top:.4rem"><b>${escapeHtml(j.title || j.source_url)}</b></div>
             ${j.quality ? '<div>Quality: ' + escapeHtml(j.quality) + '</div>' : ''}
@@ -614,13 +630,16 @@ async function fetchQueue() {
     if(queued.length > 0) {
       html += '<div class="section-header"><div class="section-title">Pending Queue (' + queued.length + ')</div></div>';
       queued.forEach((j, idx) => {
+        const isOpen = openCards.has(j.id);
+        const transformStyle = isOpen ? 'transform: translateX(-70px);' : '';
+        
         html += `<div class="swipe-container">
           <div class="swipe-action-bg">
             <button class="swipe-action-btn" onclick="deleteCard('${j.id}')">
               <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6"/></svg>
             </button>
           </div>
-          <div class="card queued" id="card-el-${j.id}" ontouchstart="handleTouchStart(event, '${j.id}')" ontouchmove="handleTouchMove(event, '${j.id}')" ontouchend="handleTouchEnd(event, '${j.id}')">
+          <div class="card queued" id="card-el-${j.id}" style="${transformStyle}" ontouchstart="handleTouchStart(event, '${j.id}')" ontouchmove="handleTouchMove(event, '${j.id}')" ontouchend="handleTouchEnd(event, '${j.id}')">
             <div><span class="badge badge-queued">Queue Position #${idx + 1}</span></div>
             <div style="margin-top:.4rem;word-break:break-all"><b>${escapeHtml(j.source_url)}</b></div>
             <button class="cancel" onclick="cancelJob('${j.id}')">Remove from Queue</button>
@@ -635,6 +654,8 @@ async function fetchQueue() {
         <button class="clear-btn" onclick="clearAllHistory()">Clear All</button>
       </div>`;
       finished.slice(0, 10).forEach(j => {
+        const isOpen = openCards.has(j.id);
+        const transformStyle = isOpen ? 'transform: translateX(-70px);' : '';
         const bClass = j.status === 'done' ? 'badge-done' : 'badge-error';
         const copyBtn = j.result_url ? `<button class="copy-btn" onclick="copyToClipboard('${escapeHtml(j.result_url)}', this)" title="Copy Link">
           <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
@@ -646,7 +667,7 @@ async function fetchQueue() {
               <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6"/></svg>
             </button>
           </div>
-          <div class="card ${j.status}" id="card-el-${j.id}" ontouchstart="handleTouchStart(event, '${j.id}')" ontouchmove="handleTouchMove(event, '${j.id}')" ontouchend="handleTouchEnd(event, '${j.id}')">
+          <div class="card ${j.status}" id="card-el-${j.id}" style="${transformStyle}" ontouchstart="handleTouchStart(event, '${j.id}')" ontouchmove="handleTouchMove(event, '${j.id}')" ontouchend="handleTouchEnd(event, '${j.id}')">
             <div><span class="badge ${bClass}">${escapeHtml(j.status)}</span></div>
             <div style="margin-top:.3rem"><b>${escapeHtml(j.title || j.source_url)}</b></div>
             ${j.result_url ? '<div class="url-row"><a href="' + escapeHtml(j.result_url) + '" target="_blank">' + escapeHtml(j.result_url) + '</a>' + copyBtn + '</div>' : ''}
