@@ -98,7 +98,6 @@ def plan_transcode(info):
     return chosen, {"vbr": vbr, "abr": abr, "scale": scale}, MAX_BYTES, target_h
 
 def build_ffmpeg_cmd(chosen, out_path, enc=None, extra_headers=None, proxy=None):
-    # Added -progress pipe:2 to stream real-time progress metrics to stderr
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-progress", "pipe:2", "-y", "-nostdin"]
     for f in chosen:
         merged_headers = {**(f.get("http_headers") or {}), **(extra_headers or {})}
@@ -203,6 +202,7 @@ def process_job_sync(jid, source_url):
             status="downloading & processing",
             quality=f"{vf.get('height') or 'stream'}p",
             title=title_text,
+            total_size=size if (size and size > 0 and size < HARD_BYTES) else None,
             log=f"Processing video streams with ffmpeg {'(via Proxy)' if job_proxy else ''}..."
         )
 
@@ -238,6 +238,10 @@ def process_job_sync(jid, source_url):
                 job["bytes"] = curr_size
                 
                 dl_pct = job.get("download_pct")
+                if dl_pct and dl_pct > 0.5:
+                    # Dynamically update real-time projected total size
+                    job["total_size"] = int(curr_size / (dl_pct / 100.0))
+
                 if dl_pct is not None:
                     job["log"] = f"Processing video streams: {dl_pct:.1f}% ({curr_size / 1e6:.1f} MB)"
                 else:
