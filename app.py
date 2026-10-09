@@ -1,21 +1,21 @@
-"""yt-dlp -> ffmpeg (pipe) -> litterbox.catbox.moe (1 GB limit, 1-hour expiry)."""
+"""yt-dlp -> ffmpeg -> curl (Litterbox 1GB / 1h expiry).
+FastAPI Server with Async Queue & Native cURL Uploads.
+"""
+import asyncio
 import os
 import re
 import subprocess
-import tempfile
-import threading
 import time
 import uuid
-import requests
 import yt_dlp
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-MAX_BYTES = int(float(os.getenv("MAX_MB", "1000")) * 1_000_000)  # 1 GB target
-HARD_BYTES = 1_050_000_000                                        # 1.05 GB safety cap
+MAX_BYTES = int(float(os.getenv("MAX_MB", "1000")) * 1_000_000)  # 1 GB target limit
+HARD_BYTES = 1_050_000_000                                        # 1.05 GB ceiling
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "").strip()
-LITTERBOX = "https://litterbox.catbox.moe/resources/internals/api.php"
+LITTERBOX_URL = "https://litterbox.catbox.moe/resources/internals/api.php"
 PROXY = os.getenv("PROXY", "").strip()
 YT_COOKIES = os.getenv("YT_COOKIES", "").strip()
 COOKIE_PATH = "/tmp/cookies.txt"
@@ -26,23 +26,7 @@ if YT_COOKIES:
 
 app = FastAPI()
 JOBS: dict[str, dict] = {}
-SEM = threading.Semaphore(int(os.getenv("MAX_CONCURRENT", "1")))
-
-
-class ProgressFileReader:
-    """File wrapper that updates job bytes during HTTP post upload."""
-    def __init__(self, fp, job_ref):
-        self._fp = fp
-        self._job = job_ref
-
-    def read(self, size=-1):
-        chunk = self._fp.read(size)
-        if chunk:
-            self._job["bytes"] = self._fp.tell()
-        return chunk
-
-    def __getattr__(self, attr):
-        return getattr(self._fp, attr)
+JOB_QUEUE: asyncio.Queue = asyncio.Queue()
 
 
 def est_size(f, dur):
@@ -141,8 +125,8 @@ def plan_transcode(info):
     return chosen, {"vbr": vbr, "abr": abr, "scale": scale}, MAX_BYTES, target_h
 
 
-def build_cmd(chosen, enc=None):
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+def build_ffmpeg_cmd(chosen, out_path, enc=None):
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-nostdin"]
     for f in chosen:
         hdr = "".join(f"{k}: {v}\r\n" for k, v in (f.get("http_headers") or {}).items())
         if PROXY:
@@ -164,102 +148,118 @@ def build_cmd(chosen, enc=None):
     else:
         cmd += ["-c:v", "copy", "-c:a", "copy" if acodec.startswith("mp4a") else "aac"]
 
-    cmd += ["-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"]
+    cmd += ["-movflags", "+faststart", out_path]
     return cmd
 
 
-def run_job(jid, url):
+def process_job_sync(jid, url):
     job = JOBS[jid]
+    out_path = f"/tmp/{jid}.mp4"
     proc = None
-    with SEM:
-        try:
-            job.update(status="analyzing")
-            opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}
-            if PROXY:
-                opts["proxy"] = PROXY
-            if YT_COOKIES:
-                opts["cookiefile"] = COOKIE_PATH
+    try:
+        job["status"] = "analyzing URL"
+        job["log"] = "Extracting media metadata via yt-dlp..."
 
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+        opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}
+        if PROXY:
+            opts["proxy"] = PROXY
+        if YT_COOKIES:
+            opts["cookiefile"] = COOKIE_PATH
 
-            choice = pick(info)
-            enc = None
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
 
-            if not choice and os.getenv("ALLOW_TRANSCODE", "1") == "1":
-                plan = plan_transcode(info)
-                if plan:
-                    chosen, enc, size, th = plan
-                    choice = ((0, 0), chosen, size)
-                    job["note"] = f"re-encoding to {min(th, chosen[0].get('height') or th)}p to fit"
+        choice = pick(info)
+        enc = None
 
-            if not choice:
-                d = info.get("duration") or 0
-                raise RuntimeError(f"No usable format found for this URL (duration {int(d // 60)} min).")
+        if not choice and os.getenv("ALLOW_TRANSCODE", "1") == "1":
+            plan = plan_transcode(info)
+            if plan:
+                chosen, enc, size, th = plan
+                choice = ((0, 0), chosen, size)
+                job["note"] = f"re-encoding to {min(th, chosen[0].get('height') or th)}p to fit"
 
-            _, chosen, size = choice
-            vf = chosen[0]
-            job.update(status="downloading & processing",
-                       quality=f"{vf.get('height') or 'unknown'}p ~{int(size / 1e6)} MB",
-                       title=info.get("title"))
+        if not choice:
+            d = info.get("duration") or 0
+            raise RuntimeError(f"No suitable video format found under 1 GB limit (duration {int(d // 60)} min).")
 
-            name = re.sub(r"[^A-Za-z0-9_\- ]", "", info.get("title") or "")[:80].strip() or "video"
+        _, chosen, size = choice
+        vf = chosen[0]
+        job.update(
+            status="downloading & processing",
+            quality=f"{vf.get('height') or 'unknown'}p ~{int(size / 1e6)} MB",
+            title=info.get("title")
+        )
+        job["log"] = "Processing video streams with ffmpeg..."
 
-            proc = subprocess.Popen(build_cmd(chosen, enc), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            sent = 0
+        cmd = build_ffmpeg_cmd(chosen, out_path, enc)
+        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
 
-            with tempfile.TemporaryFile() as tmp:
-                while True:
-                    c = proc.stdout.read(1 << 20)
-                    if not c:
-                        break
-                    sent += len(c)
-                    job["bytes"] = sent
-                    if sent > HARD_BYTES:
-                        proc.kill()
-                        raise RuntimeError("Output exceeded the 1 GB limit; aborted.")
-                    tmp.write(c)
+        while proc.poll() is None:
+            time.sleep(0.5)
+            if os.path.exists(out_path):
+                curr_size = os.path.getsize(out_path)
+                job["bytes"] = curr_size
+                if curr_size > HARD_BYTES:
+                    proc.kill()
+                    raise RuntimeError("File size exceeded 1 GB ceiling during processing; aborted.")
 
-                if proc.wait() != 0:
-                    err_msg = proc.stderr.read().decode()[-300:]
-                    raise RuntimeError(f"ffmpeg failed (code {proc.returncode}): {err_msg}")
+        if proc.returncode != 0:
+            err_msg = proc.stderr.read().decode("utf-8", errors="replace")[-400:]
+            raise RuntimeError(f"FFmpeg failed (exit code {proc.returncode}): {err_msg}")
 
-                tmp.seek(0, os.SEEK_END)
-                actual_file_size = tmp.tell()
-                tmp.seek(0)
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise RuntimeError("FFmpeg completed but produced an empty file.")
 
-                if actual_file_size == 0:
-                    raise RuntimeError("ffmpeg produced a 0-byte video file.")
+        final_size = os.path.getsize(out_path)
+        job.update(status="uploading to litterbox (1h expiry)", total_size=final_size, bytes=final_size)
+        job["log"] = f"File processed ({final_size / 1e6:.1f} MB). Dispatching cURL upload..."
 
-                job.update(status="uploading to litterbox (1h expiry)", total_size=actual_file_size)
+        clean_title = re.sub(r"[^A-Za-z0-9_\- ]", "", info.get("title") or "")[:60].strip() or "video"
+        upload_cmd = [
+            "curl", "-s", "-S",
+            "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "-F", "reqtype=fileupload",
+            "-F", "time=1h",
+            "-F", f"fileToUpload=@{out_path};filename={clean_title}.mp4",
+            LITTERBOX_URL
+        ]
 
-                # Litterbox API payload configuration
-                data = {
-                    "reqtype": "fileupload",
-                    "time": "1h"
-                }
+        curl_proc = subprocess.run(upload_cmd, capture_output=True, text=True, timeout=1200)
 
-                wrapped_file = ProgressFileReader(tmp, job)
-                files = {
-                    "fileToUpload": (f"{name}.mp4", wrapped_file, "video/mp4")
-                }
+        if curl_proc.returncode != 0:
+            raise RuntimeError(f"cURL upload failed (code {curl_proc.returncode}): {curl_proc.stderr}")
 
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                }
+        out_url = curl_proc.stdout.strip()
+        if not out_url.startswith("http"):
+            raise RuntimeError(f"Litterbox response error: '{out_url[:200]}'")
 
-                r = requests.post(LITTERBOX, data=data, files=files, headers=headers, timeout=(30, 1200))
+        job.update(status="done", url=out_url, log="Upload completed successfully!")
 
-            out = r.text.strip()
-            if not out.startswith("http"):
-                raise RuntimeError(f"Litterbox output error [HTTP {r.status_code}]: '{out[:200]}'")
+    except Exception as e:
+        if proc and proc.poll() is None:
+            proc.kill()
+        job.update(status="error", error=str(e)[:400], log=f"Failed: {str(e)[:200]}")
+    finally:
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
 
-            job.update(status="done", url=out)
 
-        except Exception as e:
-            if proc and proc.poll() is None:
-                proc.kill()
-            job.update(status="error", error=str(e)[:400])
+async def queue_worker():
+    while True:
+        jid = await JOB_QUEUE.get()
+        job = JOBS.get(jid)
+        if job and job["status"] == "queued":
+            await asyncio.to_thread(process_job_sync, jid, job["url"])
+        JOB_QUEUE.task_done()
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(queue_worker())
 
 
 class Req(BaseModel):
@@ -268,7 +268,7 @@ class Req(BaseModel):
 
 
 @app.post("/api/jobs")
-def create(req: Req):
+async def create(req: Req):
     if ACCESS_TOKEN and req.token != ACCESS_TOKEN:
         raise HTTPException(401, "bad token")
     if not re.match(r"^https?://", req.url):
@@ -276,8 +276,8 @@ def create(req: Req):
     for k in list(JOBS)[:-30]:
         JOBS.pop(k, None)
     jid = uuid.uuid4().hex[:10]
-    JOBS[jid] = {"status": "queued", "bytes": 0, "t": time.time()}
-    threading.Thread(target=run_job, args=(jid, req.url), daemon=True).start()
+    JOBS[jid] = {"status": "queued", "bytes": 0, "log": "Queued for processing...", "t": time.time()}
+    await JOB_QUEUE.put(jid)
     return {"id": jid}
 
 
@@ -306,7 +306,7 @@ if(!r.ok){o.textContent='Error '+r.status;return}
 const {id}=await r.json();
 const i=setInterval(async()=>{const j=await (await fetch('/api/jobs/'+id)).json();
 const sizeStr = j.total_size ? ((j.bytes/1e6).toFixed(1) + '/' + (j.total_size/1e6).toFixed(1) + ' MB') : ((j.bytes/1e6).toFixed(1) + ' MB');
-o.textContent=j.status+(j.quality?'\\n'+j.quality:'')+'\\n'+sizeStr
-+(j.note?'\\n'+j.note:'')+(j.error?'\\n'+j.error:'')+(j.url?'\\n'+j.url:'');
+o.textContent='Status: '+j.status+(j.quality?'\\nQuality: '+j.quality:'')+'\\nSize: '+sizeStr
++(j.log?'\\nLog: '+j.log:'')+(j.note?'\\nNote: '+j.note:'')+(j.error?'\\nError: '+j.error:'')+(j.url?'\\n\\nURL: '+j.url:'');
 if(j.status=='done'||j.status=='error')clearInterval(i)},1500)}
 </script>"""
