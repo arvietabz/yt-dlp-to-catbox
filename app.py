@@ -19,7 +19,16 @@ MAX_BYTES = int(float(os.getenv("MAX_MB", "1000")) * 1_000_000)  # 1 GB target l
 HARD_BYTES = 1_050_000_000                                        # 1.05 GB ceiling
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "").strip()
 LITTERBOX_URL = "https://litterbox.catbox.moe/resources/internals/api.php"
-PROXY = os.getenv("PROXY", "").strip()
+
+# Clean HTTP Proxy reading directly from Render environment variables (no hardcoding)
+RAW_PROXY = os.getenv("PROXY", "").strip()
+if RAW_PROXY.lower().startswith("http://"):
+    PROXY = "http://" + RAW_PROXY[7:]
+elif RAW_PROXY.lower().startswith("https://"):
+    PROXY = "https://" + RAW_PROXY[8:]
+else:
+    PROXY = RAW_PROXY
+
 YT_COOKIES = os.getenv("YT_COOKIES", "").strip()
 COOKIE_PATH = "/tmp/cookies.txt"
 
@@ -319,15 +328,14 @@ async def queue_worker():
 
 @app.on_event("startup")
 async def startup_event():
-    # Initialize Tailscale user-space daemon for direct WireGuard connection to phone
+    # Initialize Tailscale user-space daemon for direct connection
     ts_authkey = os.getenv("TAILSCALE_AUTHKEY", "").strip()
     if ts_authkey:
         print("Starting Tailscale user-space daemon...")
         try:
             subprocess.Popen([
                 "tailscaled", 
-                "--tun=userspace-networking", 
-                "--socks5-server=localhost:1055"
+                "--tun=userspace-networking"
             ])
             await asyncio.sleep(2)
             subprocess.Popen([
