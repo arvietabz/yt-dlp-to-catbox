@@ -159,10 +159,16 @@ def process_job_sync(jid, source_url):
                 "no_warnings": True,
                 "noplaylist": True,
                 "skip_download": True,
-                "http_headers": custom_headers if custom_headers else None,
+                "impersonate": "chrome",
+                "http_headers": {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    **(custom_headers if custom_headers else {})
+                },
                 "extractor_args": {
                     "youtube": {
-                        "player_client": ["android", "web", "mweb"]
+                        "player_client": ["android", "ios", "mweb", "web"],
+                        "player_skip": ["configs", "webpage"]
                     }
                 }
             }
@@ -196,9 +202,10 @@ def process_job_sync(jid, source_url):
         vf = chosen[0]
         title_text = job.get("custom_title") or info.get("title") or "Unsupported Video Stream"
         
+        # Display resolution only to eliminate misleading pre-estimate size numbers
         job.update(
             status="downloading & processing",
-            quality=f"{vf.get('height') or 'stream'}p ~{int(size / 1e6)} MB",
+            quality=f"{vf.get('height') or 'stream'}p",
             title=title_text,
             log=f"Processing video streams with ffmpeg {'(via Proxy)' if job_proxy else ''}..."
         )
