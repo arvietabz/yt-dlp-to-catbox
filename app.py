@@ -11,6 +11,12 @@ ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "")
 USERHASH = os.getenv("CATBOX_USERHASH", "")
 BUFFER_IN_RAM = os.getenv("BUFFER_IN_RAM", "0") == "1"  # fallback if catbox rejects chunked upload
 CATBOX = "https://catbox.moe/user/api.php"
+PROXY = os.getenv("PROXY", "")          # e.g. http://user:pass@host:port
+YT_COOKIES = os.getenv("YT_COOKIES", "")  # full contents of a Netscape cookies.txt
+COOKIE_PATH = "/tmp/cookies.txt"
+if YT_COOKIES:
+    with open(COOKIE_PATH, "w") as _f:  # tiny file, not video data
+        _f.write(YT_COOKIES)
 
 app = FastAPI()
 JOBS: dict[str, dict] = {}
@@ -21,8 +27,9 @@ def est_size(f, dur):
     s = f.get("filesize") or f.get("filesize_approx")
     if s:
         return s
-    if f.get("tbr") and dur:
-        return f["tbr"] * 1000 / 8 * dur
+    br = f.get("tbr") or ((f.get("vbr") or 0) + (f.get("abr") or 0)) or None
+    if br and dur:
+        return br * 1000 / 8 * dur
     return None
 
 
@@ -50,21 +57,71 @@ def pick(info):
                 cands.append(((v.get("height") or 0, v.get("tbr") or 0), [v, a], vs + as_))
                 break
     if not cands:
+        # sizes unknown for everything: gamble on a modest quality, hard cap aborts if too big
+        unk = [p for p in prog if not est_size(p, dur) and (p.get("height") or 0) <= 720]
+        if unk:
+            unk.sort(key=lambda f: f.get("height") or 0, reverse=True)
+            return ((0, 0), [unk[0]], MAX_BYTES)
+        unk_v = [v for v in vid if not est_size(v, dur) and (v.get("height") or 0) <= 720]
+        if unk_v and aud:
+            unk_v.sort(key=lambda f: f.get("height") or 0, reverse=True)
+            return ((0, 0), [unk_v[0], aud[-1]], MAX_BYTES)
         return None
     cands.sort(key=lambda c: c[0], reverse=True)
     return cands[0]
 
 
-def build_cmd(chosen):
+def plan_transcode(info):
+    """Pick a source + bitrate so the re-encoded output lands under MAX_BYTES."""
+    dur = info.get("duration")
+    if not dur:
+        return None
+    abr = 96
+    total_kbps = MAX_BYTES * 0.92 * 8 / dur / 1000      # 8% safety margin
+    vbr = int(total_kbps - abr)
+    for h in (1080, 720, 480, 360, 240):
+        need = {1080: 2500, 720: 1200, 480: 600, 360: 300, 240: 150}[h]
+        if vbr >= need:
+            target_h = h
+            break
+    else:
+        return None  # too long even for 240p
+    fmts = [f for f in info.get("formats", []) if f.get("url") and f.get("protocol") != "mhtml"]
+    vid = [f for f in fmts if f.get("vcodec") not in (None, "none")]
+    ok = [f for f in vid if (f.get("height") or 0) <= target_h] or vid
+    ok.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
+    src = ok[0]
+    chosen = [src]
+    if src.get("acodec") in (None, "none"):
+        aud = [f for f in fmts if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
+        if not aud:
+            return None
+        aud.sort(key=lambda f: f.get("abr") or 0, reverse=True)
+        chosen.append(aud[0])
+    scale = target_h if (src.get("height") or 0) > target_h else None
+    return chosen, {"vbr": vbr, "abr": abr, "scale": scale}, MAX_BYTES, target_h
+
+
+def build_cmd(chosen, enc=None):
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
     for f in chosen:
         hdr = "".join(f"{k}: {v}\r\n" for k, v in (f.get("http_headers") or {}).items())
+        if PROXY:  # stream URLs are IP-locked, so ffmpeg must use the same proxy
+            cmd += ["-http_proxy", PROXY]
         cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                 "-headers", hdr, "-i", f["url"]]
     if len(chosen) == 2:
         cmd += ["-map", "0:v:0", "-map", "1:a:0"]
     acodec = (chosen[-1].get("acodec") or "")
-    cmd += ["-c:v", "copy", "-c:a", "copy" if acodec.startswith("mp4a") else "aac"]
+    if enc:  # re-encode to hit the size target
+        v = enc["vbr"]
+        if enc["scale"]:
+            cmd += ["-vf", f"scale=-2:{enc['scale']}"]
+        cmd += ["-c:v", "libx264", "-preset", os.getenv("X264_PRESET", "veryfast"),
+                "-pix_fmt", "yuv420p", "-b:v", f"{v}k", "-maxrate", f"{int(v * 1.1)}k",
+                "-bufsize", f"{v * 2}k", "-c:a", "aac", "-b:a", f"{enc['abr']}k"]
+    else:
+        cmd += ["-c:v", "copy", "-c:a", "copy" if acodec.startswith("mp4a") else "aac"]
     cmd += ["-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"]
     return cmd
 
@@ -76,11 +133,27 @@ def run_job(jid, url):
         try:
             job.update(status="analyzing")
             opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True}
+            if PROXY:
+                opts["proxy"] = PROXY
+            if YT_COOKIES:
+                opts["cookiefile"] = COOKIE_PATH
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             choice = pick(info)
+            enc = None
+            if not choice and os.getenv("ALLOW_TRANSCODE", "1") == "1":
+                plan = plan_transcode(info)
+                if plan:
+                    chosen, enc, size, th = plan
+                    choice = ((0, 0), chosen, size)
+                    job["note"] = f"re-encoding to {min(th, chosen[0].get('height') or th)}p to fit"
             if not choice:
-                raise RuntimeError(f"No format fits under {MAX_BYTES // 1_000_000} MB (or sizes unknown).")
+                d = info.get("duration") or 0
+                sizes = [est_size(f, d) for f in info.get("formats", []) if f.get("vcodec") not in (None, "none")]
+                sizes = [x for x in sizes if x]
+                hint = f" Smallest video format is ~{int(min(sizes) / 1e6)} MB." if sizes else " Format sizes unavailable."
+                raise RuntimeError(f"No format fits under {MAX_BYTES // 1_000_000} MB "
+                                   f"(duration {int(d // 60)} min).{hint}")
             _, chosen, size = choice
             vf = chosen[0]
             job.update(status="streaming",
@@ -95,7 +168,7 @@ def run_job(jid, url):
             post = f"\r\n--{boundary}--\r\n".encode()
             headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
 
-            proc = subprocess.Popen(build_cmd(chosen), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            proc = subprocess.Popen(build_cmd(chosen, enc), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             sent = 0
 
             def chunks():
@@ -185,6 +258,6 @@ if(!r.ok){o.textContent='Error '+r.status;return}
 const {id}=await r.json();
 const i=setInterval(async()=>{const j=await (await fetch('/api/jobs/'+id)).json();
 o.textContent=j.status+(j.quality?'\\n'+j.quality:'')+(j.bytes?'\\n'+(j.bytes/1e6).toFixed(1)+' MB':'')
-+(j.error?'\\n'+j.error:'')+(j.url?'\\n'+j.url:'');
++(j.note?'\\n'+j.note:'')+(j.error?'\\n'+j.error:'')+(j.url?'\\n'+j.url:'');
 if(j.status=='done'||j.status=='error')clearInterval(i)},1500)}
 </script>"""
