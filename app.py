@@ -40,6 +40,47 @@ app = FastAPI()
 JOBS: dict[str, dict] = {}
 JOB_QUEUE: asyncio.Queue = asyncio.Queue()
 
+@app.get("/api/test-proxy")
+def test_proxy():
+    if not PROXY:
+        return {"status": "error", "message": "PROXY environment variable is empty in Render."}
+    
+    proxies = {
+        "http": PROXY,
+        "https": PROXY,
+    }
+    
+    # First test: Ping / Connect to proxy
+    try:
+        r = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=10)
+        return {
+            "status": "success",
+            "proxy_configured": PROXY,
+            "detected_public_ip": r.json().get("ip"),
+            "message": "Proxy is working! Traffic is successfully routing through your phone."
+        }
+    except requests.exceptions.ProxyError as e:
+        return {
+            "status": "failed",
+            "error_type": "ProxyError (Authentication or Protocol invalid)",
+            "proxy_configured": PROXY,
+            "details": str(e)
+        }
+    except requests.exceptions.ConnectTimeout as e:
+        return {
+            "status": "failed",
+            "error_type": "ConnectTimeout (Render cannot reach your phone's IP/Port)",
+            "proxy_configured": PROXY,
+            "details": str(e)
+        }
+    except Exception as e:
+        return {
+            "status": "failed",
+            "error_type": type(e).__name__,
+            "proxy_configured": PROXY,
+            "details": str(e)
+        }
+
 
 def est_size(f, dur):
     s = f.get("filesize") or f.get("filesize_approx")
