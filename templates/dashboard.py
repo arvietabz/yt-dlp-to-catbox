@@ -452,8 +452,12 @@ async function fetchQueue() {{
       active.forEach(j => {{
         const isOpen = openCards.has(j.id);
         const transformStyle = isOpen ? 'transform: translateX(-70px);' : '';
-        const sizeStr = j.total_size ? ((j.bytes/1e6).toFixed(1) + '/' + (j.total_size/1e6).toFixed(1) + ' MB') : ((j.bytes/1e6).toFixed(1) + ' MB');
-        const pctBadge = (j.download_pct !== undefined && j.download_pct !== null) ? `<span class="badge badge-active" style="margin-left:4px">${j.download_pct}%</span>` : '';
+        const sizeStr = j.total_size 
+          ? ((j.bytes/1e6).toFixed(1) + ' / ' + (j.total_size/1e6).toFixed(1) + ' MB') 
+          : ((j.bytes/1e6).toFixed(1) + ' MB');
+        const pctBadge = (j.download_pct !== undefined && j.download_pct !== null) 
+          ? `<span class="badge badge-active" style="margin-left:4px">${{j.download_pct}}%</span>` 
+          : '';
 
         queueHtml += `<div class="swipe-container">
           <div class="swipe-action-bg">
