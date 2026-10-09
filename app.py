@@ -72,61 +72,12 @@ app = FastAPI()
 JOBS: dict[str, dict] = {}
 JOB_QUEUE: asyncio.Queue = asyncio.Queue()
 
-@app.get("/api/debug-url")
-def debug_url(url: str, use_proxy: bool = True):
-    """Debug endpoint to inspect raw yt-dlp format extraction."""
-    job_proxy = PROXY if use_proxy else ""
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "skip_download": True,
-    }
-    if job_proxy:
-        opts["proxy"] = job_proxy
-    if YT_COOKIES:
-        opts["cookiefile"] = COOKIE_PATH
-
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            
-        formats = info.get("formats", [])
-        parsed_formats = []
-        for f in formats:
-            parsed_formats.append({
-                "format_id": f.get("format_id"),
-                "ext": f.get("ext"),
-                "height": f.get("height"),
-                "vcodec": f.get("vcodec"),
-                "acodec": f.get("acodec"),
-                "filesize_mb": round((f.get("filesize") or f.get("filesize_approx") or 0) / 1e6, 2),
-                "tbr": f.get("tbr"),
-                "protocol": f.get("protocol")
-            })
-
-        return {
-            "status": "success",
-            "title": info.get("title"),
-            "duration_sec": info.get("duration"),
-            "extractor": info.get("extractor"),
-            "total_formats_found": len(formats),
-            "formats": parsed_formats
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "error_type": type(e).__name__,
-            "details": str(e)
-        }
-
 
 async def handle_bridge_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     """Bridge local connections on 127.0.0.1:8888 through Tailscale SOCKS5 daemon to phone."""
     try:
         ts_reader, ts_writer = await asyncio.open_connection(TS_SOCKS_HOST, TS_SOCKS_PORT)
         
-        # SOCKS5 Handshake with tailscaled
         ts_writer.write(b"\x05\x01\x00")
         await ts_writer.drain()
         socks_init = await ts_reader.readexactly(2)
@@ -134,7 +85,6 @@ async def handle_bridge_client(reader: asyncio.StreamReader, writer: asyncio.Str
             writer.close()
             return
 
-        # SOCKS5 Connect request to phone's Tailscale IP & Port
         try:
             ip_obj = ipaddress.ip_address(REMOTE_PROXY_HOST)
             if ip_obj.version == 4:
@@ -153,7 +103,6 @@ async def handle_bridge_client(reader: asyncio.StreamReader, writer: asyncio.Str
             writer.close()
             return
 
-        # Pipe traffic bi-directionally
         async def pipe(r: asyncio.StreamReader, w: asyncio.StreamWriter):
             try:
                 while True:
@@ -243,6 +192,54 @@ def test_proxy():
         }
 
 
+@app.get("/api/debug-url")
+def debug_url(url: str, use_proxy: bool = True):
+    job_proxy = PROXY if use_proxy else ""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+    }
+    if job_proxy:
+        opts["proxy"] = job_proxy
+    if YT_COOKIES:
+        opts["cookiefile"] = COOKIE_PATH
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+        formats = info.get("formats", [])
+        parsed_formats = []
+        for f in formats:
+            parsed_formats.append({
+                "format_id": f.get("format_id"),
+                "ext": f.get("ext"),
+                "height": f.get("height"),
+                "vcodec": f.get("vcodec"),
+                "acodec": f.get("acodec"),
+                "filesize_mb": round((f.get("filesize") or f.get("filesize_approx") or 0) / 1e6, 2),
+                "tbr": f.get("tbr"),
+                "protocol": f.get("protocol")
+            })
+
+        return {
+            "status": "success",
+            "title": info.get("title"),
+            "duration_sec": info.get("duration"),
+            "extractor": info.get("extractor"),
+            "total_formats_found": len(formats),
+            "formats": parsed_formats
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_type": type(e).__name__,
+            "details": str(e)
+        }
+
+
 def est_size(f, dur):
     s = f.get("filesize") or f.get("filesize_approx")
     if s:
@@ -258,25 +255,43 @@ def pick(info):
     dur = info.get("duration") or 0
     fmts = [f for f in info.get("formats", []) if f.get("url") and f.get("protocol") != "mhtml"]
     
-    vid = [f for f in fmts if f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")]
-    aud = [f for f in fmts if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
-    prog = [f for f in fmts if f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")]
-    
+    vid = []
+    aud = []
+    prog = []
+
+    for f in fmts:
+        v = f.get("vcodec")
+        a = f.get("acodec")
+        
+        # Audio only stream
+        if v == "none" and a not in (None, "none"):
+            aud.append(f)
+        # Video only stream
+        elif a == "none" and v not in (None, "none"):
+            vid.append(f)
+        # Combined stream or streams with null codec metadata (e.g. PornHub MP4/HLS)
+        elif v != "none" and a != "none":
+            prog.append(f)
+        elif (f.get("height") or 0) > 0 or f.get("ext") in ("mp4", "webm", "m3u8", "mov", "flv"):
+            prog.append(f)
+
     aud.sort(key=lambda f: f.get("abr") or f.get("tbr") or 0, reverse=True)
 
     cands = []
     for p in prog:
         s = est_size(p, dur)
-        if 0 < s <= MAX_BYTES:
-            cands.append((p.get("height") or 0, p.get("tbr") or 0, [p], s))
+        if 0 <= s <= MAX_BYTES:
+            effective_s = s if s > 0 else 50_000_000  # Default ~50MB estimate if unknown
+            cands.append((p.get("height") or 0, p.get("tbr") or 0, [p], effective_s))
 
     for v in vid:
         vs = est_size(v, dur)
         for a in aud:
             as_ = est_size(a, dur)
             tot = vs + as_
-            if 0 < tot <= MAX_BYTES:
-                cands.append((v.get("height") or 0, v.get("tbr") or 0, [v, a], tot))
+            if 0 <= tot <= MAX_BYTES:
+                effective_tot = tot if tot > 0 else 50_000_000
+                cands.append((v.get("height") or 0, v.get("tbr") or 0, [v, a], effective_tot))
                 break
 
     if cands:
@@ -284,18 +299,9 @@ def pick(info):
         best = cands[0]
         return (best[0], best[1]), best[2], best[3]
 
-    low_prog = [p for p in prog if (p.get("height") or 0) <= 1080]
-    if low_prog:
-        low_prog.sort(key=lambda f: f.get("height") or 0)
-        return ((0, 0), [low_prog[0]], MAX_BYTES)
-
-    low_vid = [v for v in vid if (v.get("height") or 0) <= 1080]
-    if low_vid:
-        low_vid.sort(key=lambda f: f.get("height") or 0)
-        chosen = [low_vid[0]]
-        if aud:
-            chosen.append(aud[-1])
-        return ((0, 0), chosen, MAX_BYTES)
+    if prog:
+        prog.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
+        return ((0, 0), [prog[0]], MAX_BYTES)
 
     return None
 
@@ -319,7 +325,7 @@ def plan_transcode(info):
         vbr = 150
 
     fmts = [f for f in info.get("formats", []) if f.get("url") and f.get("protocol") != "mhtml"]
-    vid = [f for f in fmts if f.get("vcodec") not in (None, "none")]
+    vid = [f for f in fmts if f.get("vcodec") != "none"]
     if not vid:
         return None
 
