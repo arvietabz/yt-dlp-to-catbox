@@ -58,7 +58,7 @@ def pick(info):
                 break
 
     if not cands:
-        # Fallback for unknown sizes or missing/0 duration: pick moderate format and rely on HARD_BYTES
+        # Fallback for unknown sizes or missing/0 duration: select 720p or lower and rely on HARD_BYTES guard
         unk = [p for p in prog if (p.get("height") or 0) <= 720]
         if unk:
             unk.sort(key=lambda f: f.get("height") or 0, reverse=True)
@@ -76,7 +76,7 @@ def pick(info):
 def plan_transcode(info):
     """Pick a source + bitrate so the re-encoded output lands under MAX_BYTES."""
     dur = info.get("duration")
-    # If duration is missing/invalid, assume 3 minutes (180s) to calculate conservative bitrates
+    # If duration is missing or 0, estimate based on a conservative 3-minute window
     if not dur or dur <= 0:
         dur = 180
 
