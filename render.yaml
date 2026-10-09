@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: ytcatbox
+    runtime: docker
+    plan: free
+    envVars:
+      - key: ACCESS_TOKEN   # set this so strangers can't use your server
+        sync: false
+      - key: CATBOX_USERHASH  # optional
+        sync: false
+      - key: MAX_MB
+        value: "190"
