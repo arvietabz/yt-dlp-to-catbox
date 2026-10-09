@@ -1,5 +1,5 @@
 """yt-dlp -> ffmpeg -> native Python HTTP upload (Litterbox 1GB / 1h expiry).
-FastAPI Server with Async Queue, Persistent Swipe States, & Interactive UI Dashboard.
+FastAPI Server with Async Queue, Interactive Input Controls, & Mobile UI Dashboard.
 """
 import asyncio
 import os
@@ -366,6 +366,34 @@ def home():
   button{background:#0066cc;color:#fff;font-weight:600;border:none;cursor:pointer}
   button:hover{background:#0052a3}
   
+  .input-wrapper {
+    position: relative;
+    width: 100%;
+  }
+  .input-wrapper input {
+    padding-right: 42px !important;
+  }
+  .input-action-btn {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: transparent !important;
+    border: none !important;
+    padding: 6px !important;
+    margin: 0 !important;
+    width: auto !important;
+    cursor: pointer;
+    color: #888;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+  }
+  .input-action-btn:hover {
+    color: #222;
+  }
+
   .swipe-container {
     position: relative;
     overflow: hidden;
@@ -474,7 +502,12 @@ def home():
 
 <h2>Video → Litterbox (1h Expiry / 1 GB Limit)</h2>
 <div class="card" style="z-index:1">
-  <input id="u" placeholder="Video URL">
+  <div class="input-wrapper">
+    <input id="u" placeholder="Video URL">
+    <button id="inputActionBtn" class="input-action-btn" type="button" onclick="handleInputAction()" title="Paste">
+      <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 012 2v14a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect></svg>
+    </button>
+  </div>
   <input id="t" placeholder="Access token (if set)" type="password">
   <button onclick="submitJob()">Upload to Queue</button>
 </div>
@@ -486,18 +519,58 @@ function escapeHtml(str) {
   return (str || '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-// Track open swiped cards across DOM re-renders
 const openCards = new Set();
 let touchState = {};
 
+const pasteIcon = `<svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 012 2v14a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect></svg>`;
+const clearIcon = `<svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"></path></svg>`;
+
+function updateInputActionIcon() {
+  const u = document.getElementById('u');
+  const btn = document.getElementById('inputActionBtn');
+  if (!u || !btn) return;
+  if (u.value.trim() !== '') {
+    btn.innerHTML = clearIcon;
+    btn.title = 'Clear URL';
+  } else {
+    btn.innerHTML = pasteIcon;
+    btn.title = 'Paste from Clipboard';
+  }
+}
+
+async function handleInputAction() {
+  const u = document.getElementById('u');
+  if (!u) return;
+  if (u.value.trim() !== '') {
+    u.value = '';
+    u.focus();
+    updateInputActionIcon();
+  } else {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        u.value = text.trim();
+        updateInputActionIcon();
+      }
+    } catch (err) {
+      alert('Unable to read clipboard. Please grant clipboard permission.');
+    }
+  }
+}
+
 window.addEventListener('DOMContentLoaded', () => {
+  const urlInput = document.getElementById('u');
   const tokenInput = document.getElementById('t');
+  
   const savedToken = localStorage.getItem('access_token');
   if(savedToken) tokenInput.value = savedToken;
   
   tokenInput.addEventListener('input', () => {
     localStorage.setItem('access_token', tokenInput.value.trim());
   });
+
+  urlInput.addEventListener('input', updateInputActionIcon);
+  updateInputActionIcon();
 
   fetchQueue();
   setInterval(fetchQueue, 1500);
@@ -520,6 +593,7 @@ async function submitJob() {
   
   if(r.ok) {
     u.value = '';
+    updateInputActionIcon();
     fetchQueue();
   } else {
     alert('Failed to submit job: HTTP ' + r.status);
