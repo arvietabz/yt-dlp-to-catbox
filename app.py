@@ -1,4 +1,4 @@
-"""yt-dlp -> ffmpeg (pipe) -> catbox.moe. Nothing is written to disk except temp stream file."""
+"""yt-dlp -> ffmpeg (pipe) -> litterbox.catbox.moe (1 GB limit, 1-hour expiry)."""
 import os
 import re
 import subprocess
@@ -12,11 +12,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-MAX_BYTES = int(float(os.getenv("MAX_MB", "190")) * 1_000_000)
-HARD_BYTES = 199_000_000
+MAX_BYTES = int(float(os.getenv("MAX_MB", "1000")) * 1_000_000)  # 1 GB target
+HARD_BYTES = 1_050_000_000                                        # 1.05 GB safety cap
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "").strip()
-USERHASH = os.getenv("CATBOX_USERHASH", "").strip()
-CATBOX = "https://catbox.moe/user/api.php"
+LITTERBOX = "https://litterbox.catbox.moe/resources/internals/api.php"
 PROXY = os.getenv("PROXY", "").strip()
 YT_COOKIES = os.getenv("YT_COOKIES", "").strip()
 COOKIE_PATH = "/tmp/cookies.txt"
@@ -87,12 +86,12 @@ def pick(info):
         best = cands[0]
         return (best[0], best[1]), best[2], best[3]
 
-    low_prog = [p for p in prog if (p.get("height") or 0) <= 720]
+    low_prog = [p for p in prog if (p.get("height") or 0) <= 1080]
     if low_prog:
         low_prog.sort(key=lambda f: f.get("height") or 0)
         return ((0, 0), [low_prog[0]], MAX_BYTES)
 
-    low_vid = [v for v in vid if (v.get("height") or 0) <= 720]
+    low_vid = [v for v in vid if (v.get("height") or 0) <= 1080]
     if low_vid:
         low_vid.sort(key=lambda f: f.get("height") or 0)
         chosen = [low_vid[0]]
@@ -108,7 +107,7 @@ def plan_transcode(info):
     if not dur or dur <= 0:
         dur = 180
 
-    abr = 96
+    abr = 128
     total_kbps = MAX_BYTES * 0.92 * 8 / dur / 1000
     vbr = int(total_kbps - abr)
     
@@ -218,7 +217,7 @@ def run_job(jid, url):
                     job["bytes"] = sent
                     if sent > HARD_BYTES:
                         proc.kill()
-                        raise RuntimeError("Output exceeded the 200 MB limit; aborted.")
+                        raise RuntimeError("Output exceeded the 1 GB limit; aborted.")
                     tmp.write(c)
 
                 if proc.wait() != 0:
@@ -232,22 +231,24 @@ def run_job(jid, url):
                 if actual_file_size == 0:
                     raise RuntimeError("ffmpeg produced a 0-byte video file.")
 
-                job.update(status="uploading to catbox", total_size=actual_file_size)
+                job.update(status="uploading to litterbox (1h expiry)", total_size=actual_file_size)
 
-                data = {"reqtype": "fileupload"}
-                if USERHASH and len(USERHASH) == 30 and re.match(r"^[a-f0-9]+$", USERHASH, re.IGNORECASE):
-                    data["userhash"] = USERHASH
+                # Litterbox API payload configuration
+                data = {
+                    "reqtype": "fileupload",
+                    "time": "1h"
+                }
 
                 wrapped_file = ProgressFileReader(tmp, job)
                 files = {
                     "fileToUpload": (f"{name}.mp4", wrapped_file, "video/mp4")
                 }
 
-                r = requests.post(CATBOX, data=data, files=files, timeout=(30, 600))
+                r = requests.post(LITTERBOX, data=data, files=files, timeout=(30, 1200))
 
             out = r.text.strip()
             if not out.startswith("http"):
-                raise RuntimeError(f"Catbox output error [HTTP {r.status_code}]: '{out[:200]}'")
+                raise RuntimeError(f"Litterbox output error [HTTP {r.status_code}]: '{out[:200]}'")
 
             job.update(status="done", url=out)
 
@@ -286,11 +287,11 @@ def status(jid: str):
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
-<title>yt → catbox</title>
+<title>yt → litterbox</title>
 <style>body{font:16px system-ui;max-width:520px;margin:2rem auto;padding:0 1rem}
 input,button{width:100%;padding:.8rem;margin:.3rem 0;font-size:1rem;box-sizing:border-box}
 pre{white-space:pre-wrap;word-break:break-all}</style>
-<h2>Video → Catbox</h2>
+<h2>Video → Litterbox (1h Expiry / 1 GB Limit)</h2>
 <input id=u placeholder="Video URL"><input id=t placeholder="Access token (if set)" type=password>
 <button onclick=go()>Upload</button><pre id=o></pre>
 <script>
