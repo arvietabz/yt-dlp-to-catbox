@@ -4,10 +4,13 @@ FastAPI Server with Tailscale Integration & Mobile UI Dashboard.
 File: app.py
 """
 import asyncio
+import base64
+import ipaddress
 import os
 import re
 import subprocess
 import time
+import urllib.parse
 import uuid
 import requests
 import yt_dlp
@@ -20,12 +23,41 @@ HARD_BYTES = 1_050_000_000                                        # 1.05 GB ceil
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "").strip()
 LITTERBOX_URL = "https://litterbox.catbox.moe/resources/internals/api.php"
 
-# Clean HTTP Proxy reading directly from Render environment variables (no hardcoding)
+# Raw PROXY variable read from Render environment
 RAW_PROXY = os.getenv("PROXY", "").strip()
-if RAW_PROXY.lower().startswith("http://"):
-    PROXY = "http://" + RAW_PROXY[7:]
-elif RAW_PROXY.lower().startswith("https://"):
-    PROXY = "https://" + RAW_PROXY[8:]
+
+# Internal Proxy Bridge configuration for Tailscale Userspace Networking
+LOCAL_BRIDGE_PORT = 8888
+TS_SOCKS_HOST = "127.0.0.1"
+TS_SOCKS_PORT = 1055
+
+REMOTE_PROXY_HOST = ""
+REMOTE_PROXY_PORT = 8080
+REMOTE_PROXY_USER = ""
+REMOTE_PROXY_PASS = ""
+IS_TAILSCALE_PROXY = False
+
+if RAW_PROXY:
+    parsed_url = RAW_PROXY if "://" in RAW_PROXY else "http://" + RAW_PROXY
+    parsed = urllib.parse.urlparse(parsed_url)
+    REMOTE_PROXY_HOST = parsed.hostname or ""
+    REMOTE_PROXY_PORT = parsed.port or 8080
+    REMOTE_PROXY_USER = parsed.username or ""
+    REMOTE_PROXY_PASS = parsed.password or ""
+
+    try:
+        ip = ipaddress.ip_address(REMOTE_PROXY_HOST)
+        if ip in ipaddress.ip_network("100.64.0.0/10"):
+            IS_TAILSCALE_PROXY = True
+    except ValueError:
+        pass
+
+# Determine effective proxy string used by yt-dlp, ffmpeg, and requests
+if IS_TAILSCALE_PROXY:
+    if REMOTE_PROXY_USER or REMOTE_PROXY_PASS:
+        PROXY = f"http://{REMOTE_PROXY_USER}:{REMOTE_PROXY_PASS}@127.0.0.1:{LOCAL_BRIDGE_PORT}"
+    else:
+        PROXY = f"http://127.0.0.1:{LOCAL_BRIDGE_PORT}"
 else:
     PROXY = RAW_PROXY
 
@@ -40,6 +72,83 @@ app = FastAPI()
 JOBS: dict[str, dict] = {}
 JOB_QUEUE: asyncio.Queue = asyncio.Queue()
 
+
+async def handle_bridge_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    """Bridge local connections on 127.0.0.1:8888 through Tailscale SOCKS5 daemon to phone."""
+    try:
+        ts_reader, ts_writer = await asyncio.open_connection(TS_SOCKS_HOST, TS_SOCKS_PORT)
+        
+        # SOCKS5 Handshake with tailscaled
+        ts_writer.write(b"\x05\x01\x00")
+        await ts_writer.drain()
+        socks_init = await ts_reader.readexactly(2)
+        if socks_init != b"\x05\x00":
+            writer.close()
+            return
+
+        # SOCKS5 Connect request to phone's Tailscale IP & Port
+        try:
+            ip_obj = ipaddress.ip_address(REMOTE_PROXY_HOST)
+            if ip_obj.version == 4:
+                req = b"\x05\x01\x00\x01" + ip_obj.packed + REMOTE_PROXY_PORT.to_bytes(2, "big")
+            else:
+                req = b"\x05\x01\x00\x04" + ip_obj.packed + REMOTE_PROXY_PORT.to_bytes(2, "big")
+        except ValueError:
+            host_bytes = REMOTE_PROXY_HOST.encode("utf-8")
+            req = b"\x05\x01\x00\x03" + len(host_bytes).to_bytes(1, "big") + host_bytes + REMOTE_PROXY_PORT.to_bytes(2, "big")
+            
+        ts_writer.write(req)
+        await ts_writer.drain()
+        
+        resp = await ts_reader.read(10)
+        if len(resp) < 2 or resp[1] != 0x00:
+            writer.close()
+            return
+
+        # Pipe traffic bi-directionally
+        async def pipe(r: asyncio.StreamReader, w: asyncio.StreamWriter):
+            try:
+                while True:
+                    data = await r.read(65536)
+                    if not data:
+                        break
+                    w.write(data)
+                    await w.drain()
+            except Exception:
+                pass
+            finally:
+                try:
+                    w.close()
+                except Exception:
+                    pass
+
+        await asyncio.gather(
+            pipe(reader, ts_writer),
+            pipe(ts_reader, writer),
+            return_exceptions=True
+        )
+
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+async def start_proxy_bridge():
+    if IS_TAILSCALE_PROXY and REMOTE_PROXY_HOST:
+        server = await asyncio.start_server(
+            handle_bridge_client,
+            "127.0.0.1",
+            LOCAL_BRIDGE_PORT
+        )
+        print(f"Proxy bridge running on 127.0.0.1:{LOCAL_BRIDGE_PORT} -> Tailscale SOCKS5 -> {REMOTE_PROXY_HOST}:{REMOTE_PROXY_PORT}")
+        return server
+    return None
+
+
 @app.get("/api/test-proxy")
 def test_proxy():
     if not PROXY:
@@ -50,12 +159,13 @@ def test_proxy():
         "https": PROXY,
     }
     
-    # First test: Ping / Connect to proxy
     try:
-        r = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=10)
+        r = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=15)
         return {
             "status": "success",
             "proxy_configured": PROXY,
+            "raw_proxy": RAW_PROXY,
+            "is_tailscale_proxy": IS_TAILSCALE_PROXY,
             "detected_public_ip": r.json().get("ip"),
             "message": "Proxy is working! Traffic is successfully routing through your phone."
         }
@@ -64,13 +174,15 @@ def test_proxy():
             "status": "failed",
             "error_type": "ProxyError (Authentication or Protocol invalid)",
             "proxy_configured": PROXY,
+            "raw_proxy": RAW_PROXY,
             "details": str(e)
         }
     except requests.exceptions.ConnectTimeout as e:
         return {
             "status": "failed",
-            "error_type": "ConnectTimeout (Render cannot reach your phone's IP/Port)",
+            "error_type": "ConnectTimeout (Render cannot reach phone's IP/Port)",
             "proxy_configured": PROXY,
+            "raw_proxy": RAW_PROXY,
             "details": str(e)
         }
     except Exception as e:
@@ -78,6 +190,7 @@ def test_proxy():
             "status": "failed",
             "error_type": type(e).__name__,
             "proxy_configured": PROXY,
+            "raw_proxy": RAW_PROXY,
             "details": str(e)
         }
 
@@ -369,14 +482,14 @@ async def queue_worker():
 
 @app.on_event("startup")
 async def startup_event():
-    # Initialize Tailscale user-space daemon for direct connection
     ts_authkey = os.getenv("TAILSCALE_AUTHKEY", "").strip()
     if ts_authkey:
         print("Starting Tailscale user-space daemon...")
         try:
             subprocess.Popen([
                 "tailscaled", 
-                "--tun=userspace-networking"
+                "--tun=userspace-networking",
+                "--socks5-server=localhost:1055"
             ])
             await asyncio.sleep(2)
             subprocess.Popen([
@@ -386,8 +499,12 @@ async def startup_event():
                 "--hostname=render-fastapi"
             ])
             print("Tailscale node registered successfully!")
+            await asyncio.sleep(2)
         except Exception as e:
             print(f"Tailscale startup failed: {e}")
+
+    if IS_TAILSCALE_PROXY:
+        await start_proxy_bridge()
 
     asyncio.create_task(queue_worker())
 
