@@ -72,6 +72,54 @@ app = FastAPI()
 JOBS: dict[str, dict] = {}
 JOB_QUEUE: asyncio.Queue = asyncio.Queue()
 
+@app.get("/api/debug-url")
+def debug_url(url: str, use_proxy: bool = True):
+    """Debug endpoint to inspect raw yt-dlp format extraction."""
+    job_proxy = PROXY if use_proxy else ""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+    }
+    if job_proxy:
+        opts["proxy"] = job_proxy
+    if YT_COOKIES:
+        opts["cookiefile"] = COOKIE_PATH
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+        formats = info.get("formats", [])
+        parsed_formats = []
+        for f in formats:
+            parsed_formats.append({
+                "format_id": f.get("format_id"),
+                "ext": f.get("ext"),
+                "height": f.get("height"),
+                "vcodec": f.get("vcodec"),
+                "acodec": f.get("acodec"),
+                "filesize_mb": round((f.get("filesize") or f.get("filesize_approx") or 0) / 1e6, 2),
+                "tbr": f.get("tbr"),
+                "protocol": f.get("protocol")
+            })
+
+        return {
+            "status": "success",
+            "title": info.get("title"),
+            "duration_sec": info.get("duration"),
+            "extractor": info.get("extractor"),
+            "total_formats_found": len(formats),
+            "formats": parsed_formats
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error_type": type(e).__name__,
+            "details": str(e)
+        }
+
 
 async def handle_bridge_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     """Bridge local connections on 127.0.0.1:8888 through Tailscale SOCKS5 daemon to phone."""
